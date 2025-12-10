@@ -144,7 +144,7 @@ func XDRBytes(b []byte) []byte {
 	return out
 }
 
-func DecodeInvitation(data []byte) Invitation {
+func DecodeInvitation(data []byte) (Invitation, error) {
 	offset := 0
 
 	readOpaque := func() []byte {
@@ -164,8 +164,17 @@ func DecodeInvitation(data []byte) Invitation {
 	}
 
 	from := readOpaque()
+	if from == nil {
+		return Invitation{}, fmt.Errorf("malformed invitation: missing 'from'")
+	}
 	key := readOpaque()
+	if key == nil {
+		return Invitation{}, fmt.Errorf("malformed invitation: missing 'key'")
+	}
 	addr := readOpaque()
+	if addr == nil {
+		return Invitation{}, fmt.Errorf("malformed invitation: missing 'address'")
+	}
 
 	var port uint16
 	var serverSocket bool
@@ -185,5 +194,5 @@ func DecodeInvitation(data []byte) Invitation {
 		Address:      addr,
 		Port:         port,
 		ServerSocket: serverSocket,
-	}
+	}, nil
 }

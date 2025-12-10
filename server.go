@@ -10,6 +10,7 @@ import (
 	"io"
 	"net"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -21,8 +22,6 @@ import (
 	"tunnel/pkg/security"
 )
 
-// Server represents a tunnel server that accepts incoming connections
-// through a Syncthing relay and forwards them to a local address.
 type Server struct {
 	config    ServerConfig
 	tlsConfig *tls.Config
@@ -34,27 +33,11 @@ type Server struct {
 	cancel  context.CancelFunc
 }
 
-// NewServer creates a new tunnel server with the given configuration.
-// If RelayURI is not specified, automatically discovers the fastest relay.
 func NewServer(config ServerConfig) (*Server, error) {
 	config.setDefaults()
 
-	// Auto-discover relay if not specified
-	if config.RelayURI == "" {
-		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-		defer cancel()
-		
-		uri, err := discoverRelay(ctx, config.Logger)
-		if err != nil {
-			return nil, err
-		}
-		config.RelayURI = uri
-	}
-
-	relayAddr, relayID, err := parseRelayURI(config.RelayURI)
-	if err != nil {
-		return nil, fmt.Errorf("invalid relay URI: %w", err)
-	}
+	// NOTE: We do NOT discover relay here anymore.
+	// Relay discovery happens in Run() so the banner can show the correct hint.
 
 	tlsConfig := &tls.Config{
 		Certificates:       []tls.Certificate{config.Identity.Certificate},
@@ -67,13 +50,9 @@ func NewServer(config ServerConfig) (*Server, error) {
 	return &Server{
 		config:    config,
 		tlsConfig: tlsConfig,
-		relayAddr: relayAddr,
-		relayID:   relayID,
 	}, nil
 }
 
-// Run starts the server and blocks until the context is cancelled.
-// It automatically reconnects to the relay on connection loss.
 func (s *Server) Run(ctx context.Context) error {
 	s.mu.Lock()
 	if s.running {
@@ -90,11 +69,27 @@ func (s *Server) Run(ctx context.Context) error {
 		s.mu.Unlock()
 	}()
 
-	// Log security status
+	// Discover relay HERE, at the start of Run(), not in NewServer()
+	if s.config.RelayURI == "" {
+		uri, err := discoverRelay(ctx, s.config.Logger, nil)
+		if err != nil {
+			return err
+		}
+		s.config.RelayURI = uri
+	}
+
+	relayAddr, relayID, err := parseRelayURI(s.config.RelayURI)
+	if err != nil {
+		return fmt.Errorf("invalid relay URI: %w", err)
+	}
+	s.relayAddr = relayAddr
+	s.relayID = relayID
+
+	// Log access policy
 	if len(s.config.AllowedClientIDs) == 0 && !s.config.AllowAnyClient {
-		s.log("warn", "No allowed clients configured. Server is open to ALL connections.")
+		s.log("info", "No client whitelist configured. Defaulting to OPEN access.")
 	} else if s.config.AllowAnyClient {
-		s.log("warn", "Server configured to allow ANY client.")
+		s.log("warn", "Server configured to explicitly allow ANY client.")
 	} else {
 		s.log("info", fmt.Sprintf("Access restricted to %d client(s)", len(s.config.AllowedClientIDs)))
 	}
@@ -118,7 +113,6 @@ func (s *Server) Run(ctx context.Context) error {
 	}
 }
 
-// Stop gracefully stops the server.
 func (s *Server) Stop() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -127,17 +121,10 @@ func (s *Server) Stop() {
 	}
 }
 
-// DeviceID returns the server's device ID in compact format.
 func (s *Server) DeviceID() string {
 	return s.config.Identity.CompactID
 }
 
-// FullDeviceID returns the server's device ID in full Syncthing format.
-func (s *Server) FullDeviceID() string {
-	return s.config.Identity.FullID
-}
-
-// RelayURI returns the relay URI being used.
 func (s *Server) RelayURI() string {
 	return s.config.RelayURI
 }
@@ -148,11 +135,9 @@ func (s *Server) runSession(ctx context.Context) error {
 		return err
 	}
 
-	// Create a monitoring goroutine to close the connection immediately
-	// upon context cancellation. This ensures ReadMessage unblocks.
 	done := make(chan struct{})
 	defer close(done)
-	
+
 	go func() {
 		select {
 		case <-ctx.Done():
@@ -162,6 +147,16 @@ func (s *Server) runSession(ctx context.Context) error {
 	}()
 
 	defer relayConn.Close()
+
+	// CRITICAL: Generate Device ID with relay hint AFTER connecting
+	idWithHint := s.generateDeviceIDWithHint(relayConn)
+
+	s.log("ok", "Joined relay")
+
+	// NOW trigger the callback - this is where the banner should be printed
+	if s.config.OnRelayJoined != nil {
+		s.config.OnRelayJoined(s.relayAddr, idWithHint)
+	}
 
 	s.log("info", "Waiting for connections...")
 
@@ -183,15 +178,60 @@ func (s *Server) runSession(ctx context.Context) error {
 			protocol.WriteMessage(relayConn, protocol.MsgPong, nil)
 
 		case protocol.MsgSessionInvitation:
-			inv := protocol.DecodeInvitation(body)
+			inv, err := protocol.DecodeInvitation(body)
+			if err != nil {
+				s.log("error", fmt.Sprintf("Invalid invitation: %v", err))
+				continue
+			}
 			clientID := formatDeviceIDShort(inv.From)
-			s.log("info", fmt.Sprintf("Incoming connection attempt from %s", clientID))
-			go s.handleTunnel(inv)
+			s.log("info", fmt.Sprintf("Incoming connection from %s", clientID))
+
+			go s.handleTunnel(ctx, inv)
 
 		case protocol.MsgRelayFull:
 			return errors.New("relay full")
 		}
 	}
+}
+
+// generateDeviceIDWithHint creates the Device ID with embedded relay hint
+func (s *Server) generateDeviceIDWithHint(conn net.Conn) string {
+	remoteAddr := conn.RemoteAddr().String()
+
+	host, portStr, err := net.SplitHostPort(remoteAddr)
+	if err != nil {
+		s.log("warn", fmt.Sprintf("Cannot parse relay address %q: %v", remoteAddr, err))
+		return s.DeviceID()
+	}
+
+	port, err := strconv.Atoi(portStr)
+	if err != nil {
+		s.log("warn", fmt.Sprintf("Cannot parse relay port %q: %v", portStr, err))
+		return s.DeviceID()
+	}
+
+	ip := net.ParseIP(host)
+	if ip == nil {
+		s.log("warn", fmt.Sprintf("Cannot parse relay IP %q", host))
+		return s.DeviceID()
+	}
+
+	// Must be IPv4 for hint embedding
+	ip4 := ip.To4()
+	if ip4 == nil {
+		s.log("info", "Relay uses IPv6 - hint not supported")
+		return s.DeviceID()
+	}
+
+	idWithHint := security.JoinRelayHint(s.DeviceID(), ip4, port)
+
+	// Verify hint was added (should be 51 chars for compact ID)
+	if len(idWithHint) == len(s.DeviceID()) {
+		s.log("warn", "Failed to embed relay hint in Device ID")
+		return s.DeviceID()
+	}
+
+	return idWithHint
 }
 
 func (s *Server) connectToRelay(ctx context.Context) (*tls.Conn, error) {
@@ -219,7 +259,7 @@ func (s *Server) connectToRelay(ctx context.Context) (*tls.Conn, error) {
 	}
 
 	relayDeviceID := security.NormalizeID(security.GetDeviceID(peerCerts[0].Raw))
-	if relayDeviceID != s.relayID {
+	if s.relayID != "" && relayDeviceID != s.relayID {
 		tlsConn.Close()
 		return nil, errors.New("relay ID mismatch")
 	}
@@ -248,16 +288,20 @@ func (s *Server) connectToRelay(ctx context.Context) (*tls.Conn, error) {
 		}
 	}
 
-	s.log("ok", "Joined relay")
 	return tlsConn, nil
 }
 
-func (s *Server) handleTunnel(inv protocol.Invitation) {
+func (s *Server) handleTunnel(ctx context.Context, inv protocol.Invitation) {
 	bepConn, err := s.establishTunnel(inv)
 	if err != nil {
 		s.log("error", fmt.Sprintf("Tunnel setup failed: %v", err))
 		return
 	}
+
+	go func() {
+		<-ctx.Done()
+		bepConn.Close()
+	}()
 	defer bepConn.Close()
 
 	muxSession, err := yamux.Server(bepConn, defaultYamuxConfig())
@@ -267,21 +311,30 @@ func (s *Server) handleTunnel(inv protocol.Invitation) {
 	}
 	defer muxSession.Close()
 
-	// Re-verify client identity from the established connection
 	peerCerts := bepConn.ConnectionState().PeerCertificates
 	if len(peerCerts) == 0 {
 		s.log("error", "No peer certs in established tunnel")
 		return
 	}
 	clientID := formatDeviceIDShort(security.GetDeviceIDBytes(peerCerts[0].Raw))
-	
+
 	s.log("ok", fmt.Sprintf("Tunnel ready from %s (multiplexed)", clientID))
 
 	if s.config.OnConnect != nil {
 		s.config.OnConnect(clientID)
 	}
 
+	defer func() {
+		if s.config.OnDisconnect != nil {
+			s.config.OnDisconnect(clientID)
+		}
+	}()
+
 	for {
+		if ctx.Err() != nil {
+			return
+		}
+
 		stream, err := muxSession.Accept()
 		if err != nil {
 			if err != io.EOF && !strings.Contains(err.Error(), "closed") {
@@ -291,26 +344,23 @@ func (s *Server) handleTunnel(inv protocol.Invitation) {
 		}
 		go s.handleStream(stream)
 	}
-
-	if s.config.OnDisconnect != nil {
-		s.config.OnDisconnect(clientID)
-	}
 }
 
 func (s *Server) establishTunnel(inv protocol.Invitation) (*tls.Conn, error) {
 	u, _ := url.Parse(s.config.RelayURI)
 
+	var tunnelAddr string
 	tunnelIP := net.IP(inv.Address)
-	if len(tunnelIP) == 0 || tunnelIP.IsUnspecified() {
-		host, _, _ := net.SplitHostPort(u.Host)
-		tunnelIP = net.ParseIP(host)
-	}
 
-	if tunnelIP == nil {
-		return nil, errors.New("cannot determine tunnel IP")
+	if len(tunnelIP) > 0 && !tunnelIP.IsUnspecified() {
+		tunnelAddr = net.JoinHostPort(tunnelIP.String(), fmt.Sprintf("%d", inv.Port))
+	} else {
+		host, _, err := net.SplitHostPort(u.Host)
+		if err != nil {
+			host = u.Host
+		}
+		tunnelAddr = net.JoinHostPort(host, fmt.Sprintf("%d", inv.Port))
 	}
-
-	tunnelAddr := net.JoinHostPort(tunnelIP.String(), fmt.Sprintf("%d", inv.Port))
 
 	sessConn, err := net.DialTimeout("tcp", tunnelAddr, 10*time.Second)
 	if err != nil {
@@ -345,52 +395,35 @@ func (s *Server) establishTunnel(inv protocol.Invitation) (*tls.Conn, error) {
 		}
 	}
 
-	// SECURITY: Verify Client
 	bepConfig := &tls.Config{
 		Certificates:       []tls.Certificate{s.config.Identity.Certificate},
 		NextProtos:         []string{"bep/1.0"},
 		MinVersion:         tls.VersionTLS13,
 		ClientAuth:         tls.RequestClientCert,
-		InsecureSkipVerify: true, // Manual verification
+		InsecureSkipVerify: true,
 		VerifyPeerCertificate: func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
-			if s.config.AllowAnyClient {
-				return nil
-			}
-			
-			// Backward compatibility: If no allowed clients are specified, default to OPEN.
-			if len(s.config.AllowedClientIDs) == 0 {
+			if len(s.config.AllowedClientIDs) == 0 || s.config.AllowAnyClient {
 				return nil
 			}
 
 			if len(rawCerts) == 0 {
 				return errors.New("client did not present a certificate")
 			}
-			
-			// Calculate ID
+
 			clientID := security.GetDeviceID(rawCerts[0])
 			compactID := security.GetDeviceIDCompact(rawCerts[0])
-			
-			allowed := false
+
 			for _, allowedID := range s.config.AllowedClientIDs {
 				if allowedID == clientID || allowedID == compactID {
-					allowed = true
-					break
+					return nil
 				}
 			}
-			
-			if !allowed {
-				return fmt.Errorf("client %s not authorized", compactID)
-			}
-			return nil
+
+			return fmt.Errorf("client %s not authorized", compactID)
 		},
 	}
 
-	var bepConn *tls.Conn
-	if inv.ServerSocket {
-		bepConn = tls.Server(sessConn, bepConfig)
-	} else {
-		bepConn = tls.Client(sessConn, bepConfig)
-	}
+	bepConn := tls.Server(sessConn, bepConfig)
 
 	bepConn.SetDeadline(time.Now().Add(15 * time.Second))
 	if err := bepConn.Handshake(); err != nil {

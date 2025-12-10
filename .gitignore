@@ -1,4 +1,3 @@
-Binaries
 tunnel
 *.exe
 *.exe~
@@ -10,7 +9,6 @@ Test binary
 Coverage
 *.out
 *.prof
-Dependency directories
 vendor/
 IDE
 .idea/
@@ -18,7 +16,6 @@ IDE
 *.swp
 *.swo
 *~
-Identity files
 *.key
 .tunnel-key
 OS files

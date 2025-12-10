@@ -31,11 +31,13 @@ type ServerConfig struct {
 	ReconnectDelay time.Duration
 
 	// AllowedClientIDs is a list of Client Device IDs allowed to connect.
-	// If AllowAnyClient is false, clients not in this list are rejected.
+	// If this list is empty, the server allows ALL connections by default.
+	// To restrict access, you must populate this list.
 	AllowedClientIDs []string
 
-	// AllowAnyClient disables client verification.
-	// WARNING: This allows anyone to access the forwarded port.
+	// AllowAnyClient explicitly disables client verification.
+	// Since the default is already "Allow All" when AllowedClientIDs is empty,
+	// this flag is mostly redundant but kept for clarity.
 	AllowAnyClient bool
 
 	// OnConnect is called when a new client connects.
@@ -45,6 +47,12 @@ type ServerConfig struct {
 	// OnDisconnect is called when a client disconnects.
 	// Optional.
 	OnDisconnect func(clientID string)
+
+	// OnRelayJoined is called when the server successfully connects to a relay.
+	// It provides the relay address and the Device ID with the relay hint appended.
+	// THIS IS WHERE YOU SHOULD PRINT THE BANNER - after the hint is known!
+	// Optional but recommended.
+	OnRelayJoined func(relayAddr, deviceIDWithHint string)
 
 	// Logger is a custom logger function.
 	// If nil, logs are discarded.
@@ -58,6 +66,7 @@ type ClientConfig struct {
 	Identity Identity
 
 	// TargetID is the device ID of the server to connect to.
+	// Can be 43 chars (compact), 51 chars (compact+hint), 56 chars (standard), or 66 chars (standard+hint).
 	// Required.
 	TargetID string
 
@@ -72,7 +81,8 @@ type ClientConfig struct {
 
 	// RelayURI is the Syncthing relay server URI.
 	// Format: relay://host:port/?id=DEVICE-ID
-	// If empty, automatically discovers and uses the fastest available relay.
+	// If empty and TargetID contains a hint, uses the hinted relay.
+	// If empty and no hint, automatically discovers relays.
 	RelayURI string
 
 	// ReconnectDelay is the delay between reconnection attempts.
@@ -96,7 +106,6 @@ func (c *ServerConfig) setDefaults() {
 	if c.ForwardAddr == "" {
 		c.ForwardAddr = "127.0.0.1:22"
 	}
-	// RelayURI intentionally not defaulted - will be auto-discovered if empty
 	if c.ReconnectDelay == 0 {
 		c.ReconnectDelay = 500 * time.Millisecond
 	}
@@ -106,7 +115,6 @@ func (c *ClientConfig) setDefaults() {
 	if c.ListenAddr == "" {
 		c.ListenAddr = "127.0.0.1:2222"
 	}
-	// RelayURI intentionally not defaulted - will be auto-discovered if empty
 	if c.ReconnectDelay == 0 {
 		c.ReconnectDelay = 500 * time.Millisecond
 	}

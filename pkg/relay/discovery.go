@@ -53,23 +53,17 @@ const (
 
 // Relay represents a Syncthing relay server
 type Relay struct {
-	URL       string        `json:"url"`
-	ID        string        `json:"id"`
-	Host      string        `json:"host"`
-	Port      string        `json:"port"`
-	Latency   time.Duration `json:"latency_ns"`
-	Available bool          `json:"available"`
-	Provider  string        `json:"provider,omitempty"`
+	URL      string        `json:"url"`
+	ID       string        `json:"id"`
+	Host     string        `json:"host"`
+	Port     string        `json:"port"`
+	Latency  time.Duration `json:"latency_ns"`
+	Provider string        `json:"provider,omitempty"`
 }
 
 // LatencyMS returns latency in milliseconds
 func (r *Relay) LatencyMS() float64 {
 	return float64(r.Latency) / float64(time.Millisecond)
-}
-
-// URI returns the relay URI suitable for use in config
-func (r *Relay) URI() string {
-	return r.URL
 }
 
 // Options configures the relay discovery process
@@ -362,7 +356,6 @@ func TestLatency(ctx context.Context, r *Relay, opts *Options) error {
 	}
 
 	r.Latency = minLatency
-	r.Available = true
 
 	return nil
 }

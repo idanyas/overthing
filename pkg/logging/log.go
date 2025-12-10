@@ -62,6 +62,24 @@ func printf(format string, args ...interface{}) {
 	mu.Unlock()
 }
 
+// Log handles dynamic log levels
+func Log(level, message string) {
+	switch strings.ToLower(level) {
+	case "info":
+		Info("%s", message)
+	case "ok":
+		OK("%s", message)
+	case "warn", "warning":
+		Warn("%s", message)
+	case "error":
+		Error("%s", message)
+	case "fatal":
+		Fatal("%s", message)
+	default:
+		Info("[%s] %s", level, message)
+	}
+}
+
 // Info logs an informational message
 func Info(format string, args ...interface{}) {
 	msg := fmt.Sprintf(format, args...)
