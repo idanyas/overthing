@@ -31,13 +31,13 @@ type Server struct {
 	mu      sync.Mutex
 	running bool
 	cancel  context.CancelFunc
+	
+	// Limit concurrent streams to prevent resource exhaustion
+	streamSem chan struct{}
 }
 
 func NewServer(config ServerConfig) (*Server, error) {
 	config.setDefaults()
-
-	// NOTE: We do NOT discover relay here anymore.
-	// Relay discovery happens in Run() so the banner can show the correct hint.
 
 	tlsConfig := &tls.Config{
 		Certificates:       []tls.Certificate{config.Identity.Certificate},
@@ -46,10 +46,14 @@ func NewServer(config ServerConfig) (*Server, error) {
 		MinVersion:         tls.VersionTLS13,
 		MaxVersion:         tls.VersionTLS13,
 	}
+	
+	// Initialize semaphore with 1024 concurrent stream limit
+	streamSem := make(chan struct{}, 1024)
 
 	return &Server{
 		config:    config,
 		tlsConfig: tlsConfig,
+		streamSem: streamSem,
 	}, nil
 }
 
@@ -69,7 +73,6 @@ func (s *Server) Run(ctx context.Context) error {
 		s.mu.Unlock()
 	}()
 
-	// Discover relay HERE, at the start of Run(), not in NewServer()
 	if s.config.RelayURI == "" {
 		uri, err := discoverRelay(ctx, s.config.Logger, nil)
 		if err != nil {
@@ -85,9 +88,11 @@ func (s *Server) Run(ctx context.Context) error {
 	s.relayAddr = relayAddr
 	s.relayID = relayID
 
-	// Log access policy
+	// INTENTIONAL: Default to Open Access (Allow All).
+	// If no AllowedClientIDs are provided, we allow ANYONE to connect.
+	// This is the intended design for zero-conf usage.
 	if len(s.config.AllowedClientIDs) == 0 && !s.config.AllowAnyClient {
-		s.log("info", "No client whitelist configured. Defaulting to OPEN access.")
+		s.log("info", "No client whitelist configured. Defaulting to OPEN access (Allow All).")
 	} else if s.config.AllowAnyClient {
 		s.log("warn", "Server configured to explicitly allow ANY client.")
 	} else {
@@ -148,12 +153,10 @@ func (s *Server) runSession(ctx context.Context) error {
 
 	defer relayConn.Close()
 
-	// CRITICAL: Generate Device ID with relay hint AFTER connecting
 	idWithHint := s.generateDeviceIDWithHint(relayConn)
 
 	s.log("ok", "Joined relay")
 
-	// NOW trigger the callback - this is where the banner should be printed
 	if s.config.OnRelayJoined != nil {
 		s.config.OnRelayJoined(s.relayAddr, idWithHint)
 	}
@@ -194,7 +197,6 @@ func (s *Server) runSession(ctx context.Context) error {
 	}
 }
 
-// generateDeviceIDWithHint creates the Device ID with embedded relay hint
 func (s *Server) generateDeviceIDWithHint(conn net.Conn) string {
 	remoteAddr := conn.RemoteAddr().String()
 
@@ -215,17 +217,10 @@ func (s *Server) generateDeviceIDWithHint(conn net.Conn) string {
 		s.log("warn", fmt.Sprintf("Cannot parse relay IP %q", host))
 		return s.DeviceID()
 	}
+	
+	// Support both IPv4 and IPv6
+	idWithHint := security.JoinRelayHint(s.DeviceID(), ip, port)
 
-	// Must be IPv4 for hint embedding
-	ip4 := ip.To4()
-	if ip4 == nil {
-		s.log("info", "Relay uses IPv6 - hint not supported")
-		return s.DeviceID()
-	}
-
-	idWithHint := security.JoinRelayHint(s.DeviceID(), ip4, port)
-
-	// Verify hint was added (should be 51 chars for compact ID)
 	if len(idWithHint) == len(s.DeviceID()) {
 		s.log("warn", "Failed to embed relay hint in Device ID")
 		return s.DeviceID()
@@ -342,7 +337,18 @@ func (s *Server) handleTunnel(ctx context.Context, inv protocol.Invitation) {
 			}
 			break
 		}
-		go s.handleStream(stream)
+		
+		// Concurrency limit
+		select {
+		case s.streamSem <- struct{}{}:
+			go func() {
+				defer func() { <-s.streamSem }()
+				s.handleStream(stream)
+			}()
+		case <-ctx.Done():
+			stream.Close()
+			return
+		}
 	}
 }
 
@@ -402,6 +408,8 @@ func (s *Server) establishTunnel(inv protocol.Invitation) (*tls.Conn, error) {
 		ClientAuth:         tls.RequestClientCert,
 		InsecureSkipVerify: true,
 		VerifyPeerCertificate: func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
+			// INTENTIONAL: Default to Allow All if no whitelist is provided.
+			// This is not a bug/mistake; it is designed for zero-conf ease of use.
 			if len(s.config.AllowedClientIDs) == 0 || s.config.AllowAnyClient {
 				return nil
 			}
@@ -448,6 +456,7 @@ func (s *Server) handleStream(stream net.Conn) {
 	}
 
 	if err != nil {
+		s.log("error", fmt.Sprintf("Failed to dial target: %v", err))
 		return
 	}
 	defer targetConn.Close()

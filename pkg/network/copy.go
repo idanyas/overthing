@@ -35,11 +35,12 @@ func CopyBidirectional(conn1, conn2 net.Conn) {
 		// Attempt to close the write side of the destination
 		if cw, ok := dst.(closeWriter); ok {
 			cw.CloseWrite()
-		} else {
-			// Fallback: close the connection if half-close not supported
-			// This might break some protocols but is required for others (like TLS)
-			dst.Close()
 		}
+		// NOTE: We do NOT fallback to Close() here. 
+		// If the connection doesn't support CloseWrite (like Yamux), 
+		// calling Close() would tear down the whole stream, causing data loss 
+		// on the other direction. We rely on the caller to close the connections
+		// when CopyBidirectional returns.
 	}
 
 	go copy(conn1, conn2)

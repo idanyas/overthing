@@ -78,41 +78,60 @@ func decodeBase63(s string) ([]byte, error) {
 }
 
 // JoinRelayHint appends encoded IP:Port to the Device ID.
-// Supports both Compact (43 chars) and Standard (56 chars) IDs.
-// Compact uses Base63 suffix (8 chars). Standard uses Base32 suffix (10 chars).
+// Supports both Compact and Standard IDs, and IPv4/IPv6.
 func JoinRelayHint(id string, ip net.IP, port int) string {
-	ip4 := ip.To4()
-	if ip4 == nil {
-		return id
+	var buf []byte
+	if ip4 := ip.To4(); ip4 != nil {
+		// IPv4: 4 bytes + 2 bytes = 6 bytes
+		buf = make([]byte, 6)
+		copy(buf[0:4], ip4)
+		binary.BigEndian.PutUint16(buf[4:6], uint16(port))
+	} else {
+		// IPv6: 16 bytes + 2 bytes = 18 bytes
+		buf = make([]byte, 18)
+		copy(buf[0:16], ip)
+		binary.BigEndian.PutUint16(buf[16:18], uint16(port))
 	}
-
-	// Pack IP (4 bytes) + Port (2 bytes) = 6 bytes
-	buf := make([]byte, 6)
-	copy(buf[0:4], ip4)
-	binary.BigEndian.PutUint16(buf[4:6], uint16(port))
 
 	// Compact ID Logic (Base63)
 	if len(id) == compactEncodedLen {
-		// 6 bytes -> 8 chars Base63
-		var val uint64
-		val = uint64(buf[0])<<40 | uint64(buf[1])<<32 | uint64(buf[2])<<24 | uint64(buf[3])<<16 | uint64(buf[4])<<8 | uint64(buf[5])
-
-		out := make([]byte, 8)
-		for i := 7; i >= 0; i-- {
-			out[i] = compactAlphabet[val%63]
-			val /= 63
+		// Convert buffer to Big Int then to Base63
+		num := new(big.Int).SetBytes(buf)
+		mod := new(big.Int)
+		var out []byte
+		
+		// Encode to Base63
+		for num.Cmp(bigZero) > 0 {
+			num.DivMod(num, big63, mod)
+			out = append(out, compactAlphabet[mod.Int64()])
 		}
+		
+		// Pad to expected length if needed? 
+		// Actually, standard Base63 implementation here is fixed length for ID but variable for hint?
+		// To allow robust decoding, we might need fixed length for IPv4 vs IPv6 hints.
+		// IPv4 (6 bytes) -> max 8 chars (63^8 > 2^48).
+		// IPv6 (18 bytes) -> max 25 chars (63^25 > 2^144).
+		
+		targetLen := 8
+		if len(buf) > 6 {
+			targetLen = 25
+		}
+		
+		for len(out) < targetLen {
+			out = append(out, 'A')
+		}
+		
+		// Reverse
+		for i, j := 0, len(out)-1; i < j; i, j = i+1, j-1 {
+			out[i], out[j] = out[j], out[i]
+		}
+		
 		return id + string(out)
 	}
 
 	// Standard ID Logic (Base32)
-	// We normalize first to ensure no dashes for length check, 
-	// but usually we want to preserve the input format.
-	// However, if it is a valid ID (with or without dashes), we append Base32.
-	
 	cleanID := strings.ReplaceAll(id, "-", "")
 	if len(cleanID) == standardIDLen {
-		// 6 bytes -> 10 chars Base32
 		suffix := base32.StdEncoding.WithPadding(base32.NoPadding).EncodeToString(buf)
 		return id + suffix
 	}
@@ -121,56 +140,80 @@ func JoinRelayHint(id string, ip net.IP, port int) string {
 }
 
 // SplitRelayHint tries to extract IP:Port from a Device ID.
-// Returns the cleaned ID, IP, Port, and a boolean indicating success.
 func SplitRelayHint(s string) (cleanID string, ip net.IP, port int, ok bool) {
-	// 1. Check Compact + Hint (43 + 8 = 51)
-	if len(s) == compactEncodedLen+8 {
-		cleanID = s[:compactEncodedLen]
+	// 1. Compact + Hint
+	if len(s) > compactEncodedLen && strings.HasPrefix(s, s[:compactEncodedLen]) {
+		// Check if prefix is valid compact ID chars? Assumed handled by DeviceIDFromString later.
+		// Suffix is the hint.
 		suffix := s[compactEncodedLen:]
-
-		// Decode Base63
-		var val uint64
-		for i := 0; i < 8; i++ {
-			idx := strings.IndexByte(compactAlphabet, suffix[i])
-			if idx < 0 {
-				return s, nil, 0, false
+		
+		// We expect length 8 (IPv4) or 25 (IPv6)
+		if len(suffix) == 8 || len(suffix) == 25 {
+			cleanID = s[:compactEncodedLen]
+			
+			// Decode Base63
+			num := new(big.Int)
+			for _, c := range suffix {
+				idx := strings.IndexRune(compactAlphabet, c)
+				if idx < 0 {
+					goto StandardCheck
+				}
+				num.Mul(num, big63)
+				num.Add(num, big.NewInt(int64(idx)))
 			}
-			val = val*63 + uint64(idx)
+			
+			buf := num.Bytes()
+			// Pad back to 6 or 18 bytes if leading zeros were dropped
+			if len(suffix) == 8 && len(buf) < 6 {
+				padded := make([]byte, 6)
+				copy(padded[6-len(buf):], buf)
+				buf = padded
+			} else if len(suffix) == 25 && len(buf) < 18 {
+				padded := make([]byte, 18)
+				copy(padded[18-len(buf):], buf)
+				buf = padded
+			}
+			
+			if len(buf) == 6 {
+				return decodePackedIPPort(cleanID, buf)
+			} else if len(buf) == 18 {
+				return decodePackedIPPort(cleanID, buf)
+			}
 		}
-		return decodePackedIPPort(cleanID, val)
 	}
 
-	// 2. Check Standard + Hint (Standard can have dashes)
-	// Standard length without dashes is 56. Hint is 10 chars (Base32).
-	// Total clean length = 66.
-	
+StandardCheck:
+	// 2. Standard + Hint
 	noDashes := strings.ReplaceAll(s, "-", "")
-	if len(noDashes) == standardIDLen+10 {
-		// Determine where the split is in the original string
-		// Since dashes are only in the first part, we can take the last 10 chars.
-		suffix := s[len(s)-10:]
-		cleanID = s[:len(s)-10]
+	// Standard ID is 56 chars. 
+	// IPv4 hint (6 bytes) -> Base32 -> 10 chars. Total 66.
+	// IPv6 hint (18 bytes) -> Base32 -> 29 chars. Total 85.
+	
+	if len(noDashes) == standardIDLen+10 || len(noDashes) == standardIDLen+29 {
+		hintLen := len(noDashes) - standardIDLen
+		suffix := s[len(s)-hintLen:] // works because dashes are only in the ID part
+		cleanID = s[:len(s)-hintLen]
 		
 		buf, err := base32.StdEncoding.WithPadding(base32.NoPadding).DecodeString(suffix)
-		if err != nil || len(buf) != 6 {
-			return s, nil, 0, false
+		if err == nil && (len(buf) == 6 || len(buf) == 18) {
+			return decodePackedIPPort(cleanID, buf)
 		}
-		
-		val := uint64(buf[0])<<40 | uint64(buf[1])<<32 | uint64(buf[2])<<24 | uint64(buf[3])<<16 | uint64(buf[4])<<8 | uint64(buf[5])
-		return decodePackedIPPort(cleanID, val)
 	}
 
 	return s, nil, 0, false
 }
 
-func decodePackedIPPort(cleanID string, val uint64) (string, net.IP, int, bool) {
-	ipBytes := make([]byte, 4)
-	ipBytes[0] = byte(val >> 40)
-	ipBytes[1] = byte(val >> 32)
-	ipBytes[2] = byte(val >> 24)
-	ipBytes[3] = byte(val >> 16)
-	port := int(val & 0xFFFF)
-	return cleanID, net.IP(ipBytes), port, true
+func decodePackedIPPort(cleanID string, buf []byte) (string, net.IP, int, bool) {
+	if len(buf) == 6 {
+		ip := net.IP(buf[0:4])
+		port := int(binary.BigEndian.Uint16(buf[4:6]))
+		return cleanID, ip, port, true
+	} else if len(buf) == 18 {
+		ip := net.IP(buf[0:16])
+		port := int(binary.BigEndian.Uint16(buf[16:18]))
+		return cleanID, ip, port, true
+	}
+	return cleanID, nil, 0, false
 }
 
 func LoadOrGenerateIdentity(path string) (tls.Certificate, string, string) {
@@ -320,6 +363,7 @@ func DeviceIDFromString(id string) ([]byte, error) {
 		id = cleanID
 	}
 
+	// Compact ID
 	if len(id) == compactEncodedLen {
 		decoded, err := decodeBase63(id)
 		if err == nil && len(decoded) == 32 {
@@ -327,9 +371,19 @@ func DeviceIDFromString(id string) ([]byte, error) {
 		}
 	}
 
+	// Standard ID - Validate Checksums
 	noDashes := strings.ReplaceAll(id, "-", "")
 	normalized := NormalizeID(noDashes)
+	
 	if len(normalized) == 56 {
+		// Validate Luhn Checksums
+		for i := 0; i < 4; i++ {
+			chunk := normalized[i*14 : i*14+13] // The 13 data chars
+			check := rune(normalized[i*14+13])  // The 14th char is check digit
+			if luhn32CheckDigit(chunk) != check {
+				return nil, fmt.Errorf("invalid checksum in device ID group %d", i+1)
+			}
+		}
 		return DeviceIDToBytes(normalized)
 	}
 
@@ -369,6 +423,7 @@ func DeviceIDToBytes(id string) ([]byte, error) {
 	if len(id) != 56 {
 		return nil, fmt.Errorf("invalid Device ID length: %d", len(id))
 	}
+	// Extract data parts skipping check digits
 	base32Str := id[0:13] + id[14:27] + id[28:41] + id[42:55]
 	decoded, err := base32.StdEncoding.WithPadding(base32.NoPadding).DecodeString(base32Str)
 	if err != nil {

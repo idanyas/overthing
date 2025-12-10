@@ -54,24 +54,19 @@ func NewClient(config ClientConfig) (*Client, error) {
 
 	isFixedRelay := false
 
-	// Connection Strategy:
-	// 1. Explicit RelayURI in config -> Fixed. Never scan.
-	// 2. Hint in Device ID -> Dynamic. Try hint first, then scan if fails.
-	// 3. Neither -> Dynamic. Scan immediately.
-
 	if config.RelayURI != "" {
 		isFixedRelay = true
 		if config.Logger != nil {
 			config.Logger("info", fmt.Sprintf("Using configured relay: %s", config.RelayURI))
 		}
 	} else if hasHint {
-		// Populate RelayURI from hint, but keep isFixedRelay = false
-		config.RelayURI = fmt.Sprintf("relay://%s:%d", hintIP.String(), hintPort)
+		// Populate RelayURI from hint
+		// Hint IP might be IPv6
+		config.RelayURI = fmt.Sprintf("relay://%s", net.JoinHostPort(hintIP.String(), fmt.Sprintf("%d", hintPort)))
 		if config.Logger != nil {
-			config.Logger("ok", fmt.Sprintf("Extracted relay hint: %s:%d", hintIP, hintPort))
+			config.Logger("ok", fmt.Sprintf("Extracted relay hint: %s", config.RelayURI))
 		}
 	} else {
-		// No URI, no hint. Will trigger scan in getSession.
 		if config.Logger != nil {
 			config.Logger("info", "No relay hint. Will scan network for target.")
 		}
@@ -80,7 +75,6 @@ func NewClient(config ClientConfig) (*Client, error) {
 	// Parse the URI if we have one now
 	var relayAddr, relayID string
 	if config.RelayURI != "" {
-		// Reusing 'err' from above, no 'var err error' here
 		relayAddr, relayID, err = parseRelayURI(config.RelayURI)
 		if err != nil {
 			return nil, fmt.Errorf("invalid relay URI: %w", err)
@@ -241,14 +235,11 @@ func (c *Client) getSession(ctx context.Context) (*yamux.Session, error) {
 		c.bepConn = nil
 	}
 
-	// Rate limit retries slightly
 	if time.Since(c.lastError) < 100*time.Millisecond {
 		time.Sleep(100 * time.Millisecond)
 	}
 
 	for {
-		// 1. Resolve Relay URI
-		// If we don't have a URI (or we cleared it due to error), and we aren't fixed, find one.
 		if c.config.RelayURI == "" {
 			if c.isFixedRelay {
 				return nil, errors.New("relay URI missing in fixed configuration")
@@ -258,7 +249,6 @@ func (c *Client) getSession(ctx context.Context) (*yamux.Session, error) {
 			uri, err := c.scanRelays(ctx)
 			if err != nil {
 				c.lastError = time.Now()
-				// If scanning fails, wait a bit before retrying the loop
 				time.Sleep(2 * time.Second)
 				return nil, fmt.Errorf("discovery failed: %w", err)
 			}
@@ -266,17 +256,15 @@ func (c *Client) getSession(ctx context.Context) (*yamux.Session, error) {
 			c.config.RelayURI = uri
 			c.relayAddr, c.relayID, err = parseRelayURI(uri)
 			if err != nil {
-				c.config.RelayURI = "" // Bad URI, try again
+				c.config.RelayURI = "" 
 				return nil, fmt.Errorf("resolved invalid URI: %w", err)
 			}
 		}
 
-		// 2. Connect to Relay
 		relayConn, err := c.connectToRelay(ctx)
 		if err != nil {
 			c.log("warn", fmt.Sprintf("Relay connection failed: %v", err))
 			
-			// If not fixed, clear URI to trigger scan next loop
 			if !c.isFixedRelay {
 				c.log("info", "Relay unreachable. Clearing cached relay to re-scan...")
 				c.config.RelayURI = ""
@@ -286,7 +274,6 @@ func (c *Client) getSession(ctx context.Context) (*yamux.Session, error) {
 			return nil, err
 		}
 
-		// 3. Connect to Target via Relay
 		if err := protocol.WriteMessage(relayConn, protocol.MsgConnectRequest, protocol.XDRBytes(c.targetBytes)); err != nil {
 			relayConn.Close()
 			c.lastError = time.Now()
@@ -320,7 +307,6 @@ func (c *Client) getSession(ctx context.Context) (*yamux.Session, error) {
 					relayConn.Close()
 					c.lastError = time.Now()
 					
-					// Code 1: Not Found
 					if code == 1 { 
 						c.log("warn", "Target device not found on this relay")
 						
@@ -358,7 +344,7 @@ func (c *Client) getSession(ctx context.Context) (*yamux.Session, error) {
 			if err != nil {
 				c.lastError = time.Now()
 				if !c.isFixedRelay {
-					c.config.RelayURI = "" // Session establishment failed, maybe try another relay
+					c.config.RelayURI = "" 
 					continue
 				}
 				return nil, fmt.Errorf("session dial failed: %w", err)
@@ -406,7 +392,6 @@ func (c *Client) getSession(ctx context.Context) (*yamux.Session, error) {
 			return nil, fmt.Errorf("unexpected message: %d", msgType)
 		}
 
-		// 4. BEP Handshake
 		bepConfig := &tls.Config{
 			Certificates:       []tls.Certificate{c.config.Identity.Certificate},
 			NextProtos:         []string{"bep/1.0"},
@@ -435,9 +420,6 @@ func (c *Client) getSession(ctx context.Context) (*yamux.Session, error) {
 		if err := bepConn.Handshake(); err != nil {
 			tunnelConn.Close()
 			c.lastError = time.Now()
-			// TLS handshake failure usually implies correct relay but protocol issue
-			// or severe network glitch. Not necessarily wrong relay, but safer to return error
-			// than aggressively scan unless the error is specific.
 			return nil, fmt.Errorf("BEP handshake failed: %w", err)
 		}
 		bepConn.SetDeadline(time.Time{})
@@ -461,7 +443,6 @@ func (c *Client) getSession(ctx context.Context) (*yamux.Session, error) {
 	}
 }
 
-// scanRelays fetches all public relays and probes them for the target device.
 func (c *Client) scanRelays(ctx context.Context) (string, error) {
 	c.log("info", "Fetching public relay list...")
 	relays, err := relay.Discover(ctx)
@@ -480,9 +461,12 @@ func (c *Client) scanRelays(ctx context.Context) (string, error) {
 	scanCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	// 500 workers ensures we clear the queue rapidly.
-	// With 700 relays and 2s timeout, we finish in ~3-4 seconds max.
-	const workers = 500
+	// Limit concurrency based on actual number of relays
+	workers := 500
+	if len(relays) < workers {
+		workers = len(relays)
+	}
+	
 	work := make(chan relay.Relay, len(relays))
 	for _, r := range relays {
 		work <- r
@@ -496,7 +480,6 @@ func (c *Client) scanRelays(ctx context.Context) (string, error) {
 		go func() {
 			defer wg.Done()
 			for r := range work {
-				// Check for stop signal
 				select {
 				case <-scanCtx.Done():
 					return
@@ -506,7 +489,7 @@ func (c *Client) scanRelays(ctx context.Context) (string, error) {
 				if c.probeRelay(scanCtx, r) {
 					select {
 					case results <- result{uri: r.URL}:
-						cancel() // Stop all other workers immediately
+						cancel()
 					default:
 					}
 					return
@@ -535,9 +518,7 @@ func (c *Client) scanRelays(ctx context.Context) (string, error) {
 	}
 }
 
-// probeRelay checks a single relay for the target device
 func (c *Client) probeRelay(ctx context.Context, r relay.Relay) bool {
-	// 2.0s strict timeout per relay. This is enough for a good connection.
 	ctx, cancel := context.WithTimeout(ctx, 2000*time.Millisecond)
 	defer cancel()
 
@@ -554,9 +535,6 @@ func (c *Client) probeRelay(ctx context.Context, r relay.Relay) bool {
 	}
 	defer conn.Close()
 
-	// IMPORTANT: Set absolute deadline on the connection for all I/O.
-	// DialContext only handles the dial. The context doesn't apply to Handshake/Read/Write automatically.
-	// If the relay accepts TCP but hangs, Handshake would block forever without this.
 	if deadline, ok := ctx.Deadline(); ok {
 		conn.SetDeadline(deadline)
 	} else {
@@ -609,6 +587,11 @@ func (c *Client) probeRelay(ctx context.Context, r relay.Relay) bool {
 }
 
 func (c *Client) connectToRelay(ctx context.Context) (*tls.Conn, error) {
+	// SECURITY: Ensure we have a Relay ID to verify against
+	if c.relayID == "" {
+		return nil, errors.New("cannot connect to relay: missing relay ID for verification")
+	}
+
 	dialer := &net.Dialer{Timeout: 10 * time.Second}
 	conn, err := dialer.DialContext(ctx, "tcp", c.relayAddr)
 	if err != nil {
@@ -632,12 +615,11 @@ func (c *Client) connectToRelay(ctx context.Context) (*tls.Conn, error) {
 		return nil, errors.New("no peer certificates")
 	}
 
-	if c.relayID != "" {
-		relayDeviceID := security.NormalizeID(security.GetDeviceID(peerCerts[0].Raw))
-		if relayDeviceID != c.relayID {
-			tlsConn.Close()
-			return nil, errors.New("relay ID mismatch")
-		}
+	// Verify relay ID
+	relayDeviceID := security.NormalizeID(security.GetDeviceID(peerCerts[0].Raw))
+	if relayDeviceID != c.relayID {
+		tlsConn.Close()
+		return nil, fmt.Errorf("relay ID mismatch: expected %s, got %s", c.relayID, relayDeviceID)
 	}
 
 	joinPayload := make([]byte, 4)
