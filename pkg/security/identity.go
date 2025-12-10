@@ -106,12 +106,6 @@ func JoinRelayHint(id string, ip net.IP, port int) string {
 			out = append(out, compactAlphabet[mod.Int64()])
 		}
 		
-		// Pad to expected length if needed? 
-		// Actually, standard Base63 implementation here is fixed length for ID but variable for hint?
-		// To allow robust decoding, we might need fixed length for IPv4 vs IPv6 hints.
-		// IPv4 (6 bytes) -> max 8 chars (63^8 > 2^48).
-		// IPv6 (18 bytes) -> max 25 chars (63^25 > 2^144).
-		
 		targetLen := 8
 		if len(buf) > 6 {
 			targetLen = 25
@@ -143,8 +137,6 @@ func JoinRelayHint(id string, ip net.IP, port int) string {
 func SplitRelayHint(s string) (cleanID string, ip net.IP, port int, ok bool) {
 	// 1. Compact + Hint
 	if len(s) > compactEncodedLen && strings.HasPrefix(s, s[:compactEncodedLen]) {
-		// Check if prefix is valid compact ID chars? Assumed handled by DeviceIDFromString later.
-		// Suffix is the hint.
 		suffix := s[compactEncodedLen:]
 		
 		// We expect length 8 (IPv4) or 25 (IPv6)
@@ -185,9 +177,6 @@ func SplitRelayHint(s string) (cleanID string, ip net.IP, port int, ok bool) {
 StandardCheck:
 	// 2. Standard + Hint
 	noDashes := strings.ReplaceAll(s, "-", "")
-	// Standard ID is 56 chars. 
-	// IPv4 hint (6 bytes) -> Base32 -> 10 chars. Total 66.
-	// IPv6 hint (18 bytes) -> Base32 -> 29 chars. Total 85.
 	
 	if len(noDashes) == standardIDLen+10 || len(noDashes) == standardIDLen+29 {
 		hintLen := len(noDashes) - standardIDLen
@@ -396,21 +385,23 @@ func luhn32CheckDigit(s string) rune {
 	factor := 1
 	sum := 0
 
-	for i := len(s) - 1; i >= 0; i-- {
-		codepoint := strings.IndexByte(alphabet, s[i])
+	// FIX: Iterate forward, not backward
+	for _, r := range s {
+		codepoint := strings.IndexRune(alphabet, r)
 		if codepoint == -1 {
 			continue 
 		}
 
 		addend := factor * codepoint
-		addend = (addend / 32) + (addend % 32)
-		sum += addend
-
+		
 		if factor == 2 {
 			factor = 1
 		} else {
 			factor = 2
 		}
+
+		addend = (addend / 32) + (addend % 32)
+		sum += addend
 	}
 
 	remainder := sum % 32

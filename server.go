@@ -32,7 +32,6 @@ type Server struct {
 	running bool
 	cancel  context.CancelFunc
 	
-	// Limit concurrent streams to prevent resource exhaustion
 	streamSem chan struct{}
 }
 
@@ -47,7 +46,6 @@ func NewServer(config ServerConfig) (*Server, error) {
 		MaxVersion:         tls.VersionTLS13,
 	}
 	
-	// Initialize semaphore with 1024 concurrent stream limit
 	streamSem := make(chan struct{}, 1024)
 
 	return &Server{
@@ -88,9 +86,6 @@ func (s *Server) Run(ctx context.Context) error {
 	s.relayAddr = relayAddr
 	s.relayID = relayID
 
-	// INTENTIONAL: Default to Open Access (Allow All).
-	// If no AllowedClientIDs are provided, we allow ANYONE to connect.
-	// This is the intended design for zero-conf usage.
 	if len(s.config.AllowedClientIDs) == 0 && !s.config.AllowAnyClient {
 		s.log("info", "No client whitelist configured. Defaulting to OPEN access (Allow All).")
 	} else if s.config.AllowAnyClient {
@@ -158,7 +153,8 @@ func (s *Server) runSession(ctx context.Context) error {
 	s.log("ok", "Joined relay")
 
 	if s.config.OnRelayJoined != nil {
-		s.config.OnRelayJoined(s.relayAddr, idWithHint)
+		// Pass both the Persistent ID (s.DeviceID()) and the Hinted ID
+		s.config.OnRelayJoined(s.relayAddr, s.DeviceID(), idWithHint)
 	}
 
 	s.log("info", "Waiting for connections...")
@@ -198,11 +194,14 @@ func (s *Server) runSession(ctx context.Context) error {
 }
 
 func (s *Server) generateDeviceIDWithHint(conn net.Conn) string {
-	remoteAddr := conn.RemoteAddr().String()
+	targetAddr := s.relayAddr
+	if targetAddr == "" {
+		targetAddr = conn.RemoteAddr().String()
+	}
 
-	host, portStr, err := net.SplitHostPort(remoteAddr)
+	host, portStr, err := net.SplitHostPort(targetAddr)
 	if err != nil {
-		s.log("warn", fmt.Sprintf("Cannot parse relay address %q: %v", remoteAddr, err))
+		s.log("warn", fmt.Sprintf("Cannot parse relay address %q: %v", targetAddr, err))
 		return s.DeviceID()
 	}
 
@@ -214,11 +213,10 @@ func (s *Server) generateDeviceIDWithHint(conn net.Conn) string {
 
 	ip := net.ParseIP(host)
 	if ip == nil {
-		s.log("warn", fmt.Sprintf("Cannot parse relay IP %q", host))
+		s.log("warn", fmt.Sprintf("Cannot parse relay IP %q for hint", host))
 		return s.DeviceID()
 	}
 	
-	// Support both IPv4 and IPv6
 	idWithHint := security.JoinRelayHint(s.DeviceID(), ip, port)
 
 	if len(idWithHint) == len(s.DeviceID()) {
@@ -338,7 +336,6 @@ func (s *Server) handleTunnel(ctx context.Context, inv protocol.Invitation) {
 			break
 		}
 		
-		// Concurrency limit
 		select {
 		case s.streamSem <- struct{}{}:
 			go func() {
@@ -408,8 +405,6 @@ func (s *Server) establishTunnel(inv protocol.Invitation) (*tls.Conn, error) {
 		ClientAuth:         tls.RequestClientCert,
 		InsecureSkipVerify: true,
 		VerifyPeerCertificate: func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
-			// INTENTIONAL: Default to Allow All if no whitelist is provided.
-			// This is not a bug/mistake; it is designed for zero-conf ease of use.
 			if len(s.config.AllowedClientIDs) == 0 || s.config.AllowAnyClient {
 				return nil
 			}

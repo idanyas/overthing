@@ -1,4 +1,3 @@
-// Tunnel server - automatically discovers fastest relay
 package main
 
 import (
@@ -30,8 +29,6 @@ func main() {
 
 	absKeyPath, _ := filepath.Abs(*keyFile)
 
-	// NOTE: Do NOT print banner here - wait for OnRelayJoined!
-	
 	server, err := tunnel.NewServer(tunnel.ServerConfig{
 		Identity:    identity,
 		RelayURI:    *relayURI,
@@ -42,14 +39,14 @@ func main() {
 		OnDisconnect: func(clientID string) {
 			log.Printf("Client disconnected: %s", clientID)
 		},
-		OnRelayJoined: func(relayAddr, deviceIDWithHint string) {
-			// THIS is when we know the relay and can show the correct Device ID
+		OnRelayJoined: func(relayAddr, persistentID, deviceIDWithHint string) {
 			fmt.Println()
 			fmt.Println("RELAY TUNNEL SERVER")
 			fmt.Println(strings.Repeat("-", 19))
-			fmt.Printf("  Device ID: %s\n", deviceIDWithHint)
-			fmt.Printf("  Forward:   %s\n", *forwardAddr)
-			fmt.Printf("  Identity:  %s\n", absKeyPath)
+			fmt.Printf("  Persistent ID: %s\n", persistentID)
+			fmt.Printf("  ID with Hint:  %s\n", deviceIDWithHint)
+			fmt.Printf("  Forward:       %s\n", *forwardAddr)
+			fmt.Printf("  Identity:      %s\n", absKeyPath)
 			fmt.Println()
 		},
 		Logger: func(level, msg string) {

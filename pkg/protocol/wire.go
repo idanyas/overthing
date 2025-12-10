@@ -26,10 +26,8 @@ var (
 		},
 	}
 	
-	// Pool for larger messages to prevent allocation spikes/DoS
 	largeMsgPool = sync.Pool{
 		New: func() interface{} {
-			// Allocate max size. We slice it down on usage.
 			b := make([]byte, MaxMessageSize)
 			return &b
 		},
@@ -50,7 +48,7 @@ func WriteMessage(w io.Writer, msgType int32, payload []byte) error {
 	if totalLen <= 128 {
 		bufPtr := smallMsgPool.Get().(*[]byte)
 		buf := (*bufPtr)[:totalLen]
-		defer smallMsgPool.Put(bufPtr)
+		// FIX: No defer here for pool return
 
 		binary.BigEndian.PutUint32(buf[0:4], RelayMagic)
 		binary.BigEndian.PutUint32(buf[4:8], uint32(msgType))
@@ -60,14 +58,16 @@ func WriteMessage(w io.Writer, msgType int32, payload []byte) error {
 		}
 
 		_, err := w.Write(buf)
+		// Explicitly return to pool after use
+		smallMsgPool.Put(bufPtr)
 		return err
 	}
 
+	// For larger messages, use headers and writes
 	if nc, ok := w.(net.Conn); ok {
 		headerPtr := headerPool.Get().(*[]byte)
 		header := *headerPtr
-		defer headerPool.Put(headerPtr)
-
+		
 		binary.BigEndian.PutUint32(header[0:4], RelayMagic)
 		binary.BigEndian.PutUint32(header[4:8], uint32(msgType))
 		binary.BigEndian.PutUint32(header[8:12], uint32(len(payload)))
@@ -78,20 +78,23 @@ func WriteMessage(w io.Writer, msgType int32, payload []byte) error {
 		}
 
 		_, err := buffers.WriteTo(nc)
+		headerPool.Put(headerPtr)
 		return err
 	}
 
 	headerPtr := headerPool.Get().(*[]byte)
 	header := *headerPtr
-	defer headerPool.Put(headerPtr)
 
 	binary.BigEndian.PutUint32(header[0:4], RelayMagic)
 	binary.BigEndian.PutUint32(header[4:8], uint32(msgType))
 	binary.BigEndian.PutUint32(header[8:12], uint32(len(payload)))
 
 	if _, err := w.Write(header); err != nil {
+		headerPool.Put(headerPtr)
 		return err
 	}
+	headerPool.Put(headerPtr)
+	
 	if len(payload) > 0 {
 		_, err := w.Write(payload)
 		return err
@@ -102,19 +105,23 @@ func WriteMessage(w io.Writer, msgType int32, payload []byte) error {
 func ReadMessage(r io.Reader) (int32, []byte, error) {
 	headerPtr := headerPool.Get().(*[]byte)
 	header := *headerPtr
-	defer headerPool.Put(headerPtr)
 
 	if _, err := io.ReadFull(r, header); err != nil {
+		headerPool.Put(headerPtr)
 		return 0, nil, err
 	}
 
 	magic := binary.BigEndian.Uint32(header[0:4])
 	if magic != RelayMagic {
+		headerPool.Put(headerPtr)
 		return 0, nil, fmt.Errorf("invalid magic: 0x%08X", magic)
 	}
 
 	msgType := int32(binary.BigEndian.Uint32(header[4:8]))
 	length := binary.BigEndian.Uint32(header[8:12])
+	
+	// Done with header buffer
+	headerPool.Put(headerPtr)
 
 	if length > MaxMessageSize {
 		return 0, nil, fmt.Errorf("message too large: %d bytes", length)
@@ -129,35 +136,17 @@ func ReadMessage(r io.Reader) (int32, []byte, error) {
 				smallMsgPool.Put(bufPtr)
 				return 0, nil, err
 			}
-			// Copy out so we can return the buffer to pool
 			bodyCopy := make([]byte, length)
 			copy(bodyCopy, body)
 			smallMsgPool.Put(bufPtr)
 			body = bodyCopy
 		} else {
-			// Use pooled large buffer to prevent DoS via allocation
 			bufPtr := largeMsgPool.Get().(*[]byte)
-			// We must not defer Put here because we might return the slice. 
-			// However, returning a slice of a pooled buffer is dangerous if the caller holds it.
-			// The contract of ReadMessage is returning a []byte that the caller owns.
-			// So we MUST copy if we use a pool, OR we just allocate if we want to give ownership.
-			// BUT the issue is "Allocates up to 4MB immediately".
-			// If we allocate new memory, we are vulnerable.
-			// If we use pool and copy, we effectively double touch, but we don't spike allocation *count* if we are limited by pool.
-			// But wait, if we copy, we still allocate `make([]byte, length)` eventually.
-			// The only way to avoid the allocation spike is to use the pool for the read, 
-			// and then copy to a precisely sized buffer, OR return a buffer that must be released (API change).
-			// Since we cannot change API easily, we will Read into pool, then Copy.
-			// This prevents "allocating 4MB before reading". We read into existing memory. 
-			// If the Read fails (e.g. connection closes after header), we haven't allocated a new 4MB block on heap that needs GC.
-			// We just used the pool.
-			
 			tempBuf := (*bufPtr)[:length]
 			if _, err := io.ReadFull(r, tempBuf); err != nil {
 				largeMsgPool.Put(bufPtr)
 				return 0, nil, err
 			}
-			
 			body = make([]byte, length)
 			copy(body, tempBuf)
 			largeMsgPool.Put(bufPtr)

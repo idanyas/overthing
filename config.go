@@ -49,10 +49,9 @@ type ServerConfig struct {
 	OnDisconnect func(clientID string)
 
 	// OnRelayJoined is called when the server successfully connects to a relay.
-	// It provides the relay address and the Device ID with the relay hint appended.
-	// THIS IS WHERE YOU SHOULD PRINT THE BANNER - after the hint is known!
+	// It provides the relay address, the persistent Device ID, and the ID with the relay hint.
 	// Optional but recommended.
-	OnRelayJoined func(relayAddr, deviceIDWithHint string)
+	OnRelayJoined func(relayAddr, persistentID, deviceIDWithHint string)
 
 	// Logger is a custom logger function.
 	// If nil, logs are discarded.

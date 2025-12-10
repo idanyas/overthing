@@ -59,8 +59,6 @@ func runServer(args []string) {
 
 	absIdentityPath, _ := filepath.Abs(*identityFile)
 
-	// DO NOT PRINT BANNER HERE - wait for OnRelayJoined!
-
 	server, err := tunnel.NewServer(tunnel.ServerConfig{
 		Identity:    identity,
 		RelayURI:    *relayURI,
@@ -71,10 +69,10 @@ func runServer(args []string) {
 		OnDisconnect: func(clientID string) {
 			logging.Info("Client disconnected: %s", clientID)
 		},
-		OnRelayJoined: func(relayAddr, deviceIDWithHint string) {
-			// BANNER PRINTS HERE - after we know the relay and have the hint!
+		OnRelayJoined: func(relayAddr, persistentID, deviceIDWithHint string) {
 			logging.Banner("RELAY TUNNEL SERVER")
-			logging.Field("Device ID", deviceIDWithHint)
+			logging.Field("Persistent ID", persistentID)
+			logging.Field("ID with Hint", deviceIDWithHint)
 			logging.Field("Forward", *forwardAddr)
 			logging.Field("Identity", absIdentityPath)
 			logging.Blank()
@@ -94,15 +92,20 @@ func runServer(args []string) {
 
 func runClient(args []string) {
 	fs := flag.NewFlagSet("client", flag.ExitOnError)
-	targetID := fs.String("target-id", "", "Server Device ID (with or without relay hint)")
+	targetIDFlag := fs.String("target-id", "", "Server Device ID (with or without relay hint)")
 	listenAddr := fs.String("listen", "127.0.0.1:2222", "Local address to listen on")
 	identityFile := fs.String("identity", "", "Identity key file (ephemeral if empty)")
 	relayURI := fs.String("relay", "", "Relay URI (uses hint from ID if empty)")
 	fs.Parse(args)
 
-	if *targetID == "" {
-		fmt.Fprintln(os.Stderr, "Error: -target-id is required")
-		os.Exit(1)
+	targetID := *targetIDFlag
+	if targetID == "" {
+		if fs.NArg() > 0 {
+			targetID = fs.Arg(0)
+		} else {
+			fmt.Fprintln(os.Stderr, "Error: target Device ID is required")
+			os.Exit(1)
+		}
 	}
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
@@ -119,16 +122,15 @@ func runClient(args []string) {
 		identity = tunnel.GenerateIdentity()
 	}
 
-	// Print client banner immediately (no relay-dependent info here)
 	logging.Banner("RELAY TUNNEL CLIENT")
 	logging.Field("Client ID", identity.CompactID)
-	logging.Field("Target", *targetID)
+	logging.Field("Target", targetID)
 	logging.Field("Listen", *listenAddr)
 	logging.Blank()
 
 	client, err := tunnel.NewClient(tunnel.ClientConfig{
 		Identity:   identity,
-		TargetID:   *targetID,
+		TargetID:   targetID,
 		RelayURI:   *relayURI,
 		ListenAddr: *listenAddr,
 		OnTunnelEstablished: func() {

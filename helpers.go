@@ -20,7 +20,6 @@ func parseRelayURI(uri string) (addr string, deviceID string, err error) {
 		return "", "", err
 	}
 
-	// Device ID is now OPTIONAL. If missing, the client will accept the relay's identity dynamically.
 	idParam := u.Query().Get("id")
 	if idParam != "" {
 		deviceID = security.NormalizeID(idParam)
@@ -31,7 +30,6 @@ func parseRelayURI(uri string) (addr string, deviceID string, err error) {
 		return "", "", fmt.Errorf("invalid relay host: %w", err)
 	}
 
-	// Resolve hostname to IP for caching
 	ips, err := net.LookupIP(host)
 	if err != nil {
 		return u.Host, deviceID, nil
@@ -70,14 +68,14 @@ func defaultYamuxConfig() *yamux.Config {
 }
 
 func discoverRelay(ctx context.Context, logger func(level, msg string), ignore map[string]bool) (string, error) {
-	opts := relay.DefaultOptions()
+	opts := relay.FastOptions()
 
 	if logger != nil {
 		opts.OnFetchStart = func() {
 			logger("info", "Fetching relay list from Syncthing pool...")
 		}
 		opts.OnFetchComplete = func(count int) {
-			logger("info", fmt.Sprintf("Found %d relays, testing connectivity...", count))
+			logger("info", fmt.Sprintf("Found %d relays, testing for fastest...", count))
 		}
 	}
 
@@ -105,7 +103,9 @@ func discoverRelay(ctx context.Context, logger func(level, msg string), ignore m
 	}
 
 	if logger != nil {
-		logger("ok", fmt.Sprintf("Selected relay: %s", selected.URL))
+		// CLEANUP: Show only Host:Port and Latency
+		addr := net.JoinHostPort(selected.Host, selected.Port)
+		logger("ok", fmt.Sprintf("Selected relay: %s (%.1fms)", addr, selected.LatencyMS()))
 	}
 
 	return selected.URL, nil
