@@ -24,11 +24,9 @@ const (
 	DefaultMaxConcurrent = 200
 
 	// DefaultTestTimeout is the default timeout for each relay test
-	// MODIFIED: Reduced to 1.2s per user request
 	DefaultTestTimeout = 1200 * time.Millisecond
 
 	// DefaultProbesPerRelay is the number of probes for precise latency measurement
-	// MODIFIED: Increased to 3 per user request
 	DefaultProbesPerRelay = 3
 
 	// FastMaxConcurrent allows more parallelism for quick discovery
@@ -51,6 +49,9 @@ const (
 	FastMinTestDuration = 2 * time.Second
 )
 
+// Dialer is a function that matches net.Dialer.DialContext
+type Dialer func(ctx context.Context, network, address string) (net.Conn, error)
+
 // Relay represents a Syncthing relay server
 type Relay struct {
 	URL      string        `json:"url"`
@@ -68,6 +69,10 @@ func (r *Relay) LatencyMS() float64 {
 
 // Options configures the relay discovery process
 type Options struct {
+	// Dialer is an optional custom dialer for network connections.
+	// Used for both discovery (HTTP) and latency testing.
+	Dialer Dialer
+
 	// MaxConcurrent is the maximum number of concurrent latency tests
 	MaxConcurrent int
 
@@ -119,15 +124,11 @@ type Options struct {
 }
 
 // DefaultOptions returns options for thorough relay discovery.
-// Tests all relays with multiple probes for highest precision.
-// No early termination - finds the truly fastest relay.
-// Expected completion time: 5-7 seconds.
 func DefaultOptions() Options {
 	return Options{
-		MaxConcurrent:  DefaultMaxConcurrent,
-		TestTimeout:    DefaultTestTimeout,
-		ProbesPerRelay: DefaultProbesPerRelay,
-		// No early termination - test everything
+		MaxConcurrent:            DefaultMaxConcurrent,
+		TestTimeout:              DefaultTestTimeout,
+		ProbesPerRelay:           DefaultProbesPerRelay,
 		EarlyTerminateLatency:    0,
 		MinTestedBeforeEarlyStop: 0,
 		MinTestDuration:          0,
@@ -135,8 +136,6 @@ func DefaultOptions() Options {
 }
 
 // FastOptions returns options for quick relay discovery.
-// Uses single probe with smart early termination after sufficient testing.
-// Expected completion time: 2-3 seconds.
 func FastOptions() Options {
 	return Options{
 		MaxConcurrent:            FastMaxConcurrent,
@@ -157,14 +156,27 @@ var (
 )
 
 // Discover fetches the list of available relays from the Syncthing endpoint
-func Discover(ctx context.Context) ([]Relay, error) {
+func Discover(ctx context.Context, dialer Dialer) ([]Relay, error) {
+	client := &http.Client{Timeout: 30 * time.Second}
+
+	// If a custom dialer is provided, inject it into the HTTP transport
+	if dialer != nil {
+		client.Transport = &http.Transport{
+			DialContext: dialer,
+			ForceAttemptHTTP2:     true,
+			MaxIdleConns:          100,
+			IdleConnTimeout:       90 * time.Second,
+			TLSHandshakeTimeout:   10 * time.Second,
+			ExpectContinueTimeout: 1 * time.Second,
+		}
+	}
+
 	req, err := http.NewRequestWithContext(ctx, "GET", DiscoveryURL, nil)
 	if err != nil {
 		return nil, fmt.Errorf("create request: %w", err)
 	}
 	req.Header.Set("User-Agent", "github.com/idanyas/overthing/1.0")
 
-	client := &http.Client{Timeout: 30 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("fetch relays: %w", err)
@@ -238,11 +250,19 @@ func ParseURL(rawURL string) (*Relay, error) {
 }
 
 // probeLatency does a single TCP+TLS probe and returns the latency
-func probeLatency(ctx context.Context, addr string, relayID string, tlsCert *tls.Certificate) (time.Duration, error) {
+func probeLatency(ctx context.Context, addr string, relayID string, tlsCert *tls.Certificate, dialer Dialer) (time.Duration, error) {
 	start := time.Now()
 
-	dialer := &net.Dialer{}
-	conn, err := dialer.DialContext(ctx, "tcp", addr)
+	var conn net.Conn
+	var err error
+
+	if dialer != nil {
+		conn, err = dialer(ctx, "tcp", addr)
+	} else {
+		d := &net.Dialer{}
+		conn, err = d.DialContext(ctx, "tcp", addr)
+	}
+
 	if err != nil {
 		return 0, fmt.Errorf("dial: %w", err)
 	}
@@ -284,8 +304,6 @@ func probeLatency(ctx context.Context, addr string, relayID string, tlsCert *tls
 }
 
 // TestLatency tests the connection latency to a relay with multiple probes.
-// It performs TCP connect + TLS handshake and verifies the relay ID.
-// Uses minimum latency across probes for precision.
 func TestLatency(ctx context.Context, r *Relay, opts *Options) error {
 	if opts == nil {
 		defaultOpts := DefaultOptions()
@@ -297,52 +315,48 @@ func TestLatency(ctx context.Context, r *Relay, opts *Options) error {
 		probes = 1
 	}
 
-	// Pre-resolve IP to exclude DNS resolution time from the latency measurement.
-	// This ensures we measure "pure" TCP+TLS performance.
-	// We use the context-aware resolver to respect the overall test timeout.
-	ips, err := net.DefaultResolver.LookupIP(ctx, "ip", r.Host)
-	if err != nil {
-		return fmt.Errorf("dns lookup failed: %w", err)
-	}
+	addr := net.JoinHostPort(r.Host, r.Port)
 
-	var targetIP string
-	// Prefer IPv4 for better compatibility with most relays
-	for _, ip := range ips {
-		if ip.To4() != nil {
-			targetIP = ip.String()
-			break
+	// Optimization: Pre-resolve IP if NO custom dialer is present.
+	// If a custom dialer is present, we cannot assume the default resolver
+	// routes correctly, or the dialer might be a proxy requiring hostnames.
+	if opts.Dialer == nil {
+		ips, err := net.DefaultResolver.LookupIP(ctx, "ip", r.Host)
+		if err == nil {
+			var targetIP string
+			for _, ip := range ips {
+				if ip.To4() != nil {
+					targetIP = ip.String()
+					break
+				}
+			}
+			if targetIP == "" && len(ips) > 0 {
+				targetIP = ips[0].String()
+			}
+			if targetIP != "" {
+				addr = net.JoinHostPort(targetIP, r.Port)
+			}
 		}
 	}
-	// Fallback to the first available IP (e.g. IPv6) if no IPv4 found
-	if targetIP == "" && len(ips) > 0 {
-		targetIP = ips[0].String()
-	}
-	if targetIP == "" {
-		return fmt.Errorf("no IP addresses found for host %s", r.Host)
-	}
 
-	addr := net.JoinHostPort(targetIP, r.Port)
 	var minLatency time.Duration
 
 	for i := 0; i < probes; i++ {
-		// Check context before each probe
 		if ctx.Err() != nil {
 			if minLatency > 0 {
-				break // Use what we have
+				break
 			}
 			return ctx.Err()
 		}
 
 		probeCtx, cancel := context.WithTimeout(ctx, opts.TestTimeout)
-		latency, err := probeLatency(probeCtx, addr, r.ID, opts.TLSCert)
+		latency, err := probeLatency(probeCtx, addr, r.ID, opts.TLSCert, opts.Dialer)
 		cancel()
 
 		if err != nil {
 			if i == 0 {
-				// First probe failed - relay is likely unavailable
 				return err
 			}
-			// Subsequent probe failed - skip and try to use successful ones
 			continue
 		}
 
@@ -361,27 +375,30 @@ func TestLatency(ctx context.Context, r *Relay, opts *Options) error {
 }
 
 // FindFastest discovers relays and returns the one with lowest latency.
-// Results are cached for 5 minutes.
 func FindFastest(ctx context.Context, opts *Options) (*Relay, error) {
-	// Check cache first
-	cachedRelayMu.RLock()
-	if cachedRelay != nil && time.Since(cachedRelayTime) < cacheValidFor {
-		r := *cachedRelay // Copy
+	// Check cache first (only if no custom dialer, as dialers might change context)
+	if opts == nil || opts.Dialer == nil {
+		cachedRelayMu.RLock()
+		if cachedRelay != nil && time.Since(cachedRelayTime) < cacheValidFor {
+			r := *cachedRelay
+			cachedRelayMu.RUnlock()
+			return &r, nil
+		}
 		cachedRelayMu.RUnlock()
-		return &r, nil
 	}
-	cachedRelayMu.RUnlock()
 
 	results, err := FindFastestN(ctx, 1, opts)
 	if err != nil {
 		return nil, err
 	}
 
-	// Update cache
-	cachedRelayMu.Lock()
-	cachedRelay = &results[0]
-	cachedRelayTime = time.Now()
-	cachedRelayMu.Unlock()
+	// Update cache (only if default dialer)
+	if opts == nil || opts.Dialer == nil {
+		cachedRelayMu.Lock()
+		cachedRelay = &results[0]
+		cachedRelayTime = time.Now()
+		cachedRelayMu.Unlock()
+	}
 
 	return &results[0], nil
 }
@@ -393,17 +410,15 @@ func FindFastestN(ctx context.Context, n int, opts *Options) ([]Relay, error) {
 		opts = &defaultOpts
 	}
 
-	// Callback: fetch starting
 	if opts.OnFetchStart != nil {
 		opts.OnFetchStart()
 	}
 
-	relays, err := Discover(ctx)
+	relays, err := Discover(ctx, opts.Dialer)
 	if err != nil {
 		return nil, err
 	}
 
-	// Callback: fetch complete
 	if opts.OnFetchComplete != nil {
 		opts.OnFetchComplete(len(relays))
 	}
@@ -412,10 +427,6 @@ func FindFastestN(ctx context.Context, n int, opts *Options) ([]Relay, error) {
 }
 
 // TestAllAndSort tests all provided relays and returns up to n fastest ones.
-// Supports early termination when:
-// - A relay below EarlyTerminateLatency is found
-// - AND MinTestedBeforeEarlyStop relays have been tested
-// - AND MinTestDuration has elapsed since testing started
 func TestAllAndSort(ctx context.Context, relays []Relay, n int, opts *Options) ([]Relay, error) {
 	if opts == nil {
 		defaultOpts := DefaultOptions()
@@ -431,7 +442,6 @@ func TestAllAndSort(ctx context.Context, relays []Relay, n int, opts *Options) (
 		maxConcurrent = DefaultMaxConcurrent
 	}
 
-	// Create a cancellable context for early termination
 	testCtx, cancelTest := context.WithCancel(ctx)
 	defer cancelTest()
 
@@ -440,29 +450,25 @@ func TestAllAndSort(ctx context.Context, relays []Relay, n int, opts *Options) (
 	var wg sync.WaitGroup
 	sem := make(chan struct{}, maxConcurrent)
 
-	// Shared state protected by mutex
 	var mu sync.Mutex
 	var available []Relay
 	var bestRelay *Relay
 	var bestLatency time.Duration
 
-	// Atomic counters for lock-free reads
 	var tested int32
 	var stopped int32
 
-	// Callback: testing starting
 	if opts.OnTestStart != nil {
 		opts.OnTestStart(len(relays))
 	}
 
 	for i := range relays {
-		relay := relays[i] // Copy to avoid race
+		relay := relays[i]
 		wg.Add(1)
 
 		go func(r Relay) {
 			defer wg.Done()
 
-			// Check if we should stop early
 			if atomic.LoadInt32(&stopped) != 0 {
 				return
 			}
@@ -474,7 +480,6 @@ func TestAllAndSort(ctx context.Context, relays []Relay, n int, opts *Options) (
 				return
 			}
 
-			// Check again after acquiring semaphore
 			if atomic.LoadInt32(&stopped) != 0 {
 				return
 			}
@@ -487,7 +492,6 @@ func TestAllAndSort(ctx context.Context, relays []Relay, n int, opts *Options) (
 			if testErr == nil {
 				available = append(available, r)
 
-				// Check if this is the best so far
 				if bestRelay == nil || r.Latency < bestLatency {
 					bestLatency = r.Latency
 					rCopy := r
@@ -499,23 +503,14 @@ func TestAllAndSort(ctx context.Context, relays []Relay, n int, opts *Options) (
 				}
 			}
 
-			// Progress callback
 			if opts.OnProgress != nil {
 				opts.OnProgress(testedCount, len(relays))
 			}
 
-			// Result callback
 			if opts.OnResult != nil {
 				opts.OnResult(r, testErr)
 			}
 
-			// Early termination check - runs after every completion
-			// All conditions must be met:
-			// 1. Early termination is enabled (EarlyTerminateLatency > 0)
-			// 2. We've tested enough relays (testedCount >= MinTestedBeforeEarlyStop)
-			// 3. Enough time has elapsed (elapsed >= MinTestDuration)
-			// 4. We have a best relay that's fast enough
-			// 5. We haven't already stopped
 			if opts.EarlyTerminateLatency > 0 &&
 				testedCount >= opts.MinTestedBeforeEarlyStop &&
 				time.Since(startTime) >= opts.MinTestDuration &&
@@ -535,7 +530,6 @@ func TestAllAndSort(ctx context.Context, relays []Relay, n int, opts *Options) (
 
 	wg.Wait()
 
-	// Check for parent context cancellation (not our early termination)
 	if ctx.Err() != nil && atomic.LoadInt32(&stopped) == 0 {
 		return nil, ctx.Err()
 	}
@@ -544,7 +538,6 @@ func TestAllAndSort(ctx context.Context, relays []Relay, n int, opts *Options) (
 		return nil, fmt.Errorf("no available relays (tested %d)", atomic.LoadInt32(&tested))
 	}
 
-	// Sort by latency (fastest first)
 	sort.Slice(available, func(i, j int) bool {
 		return available[i].Latency < available[j].Latency
 	})
@@ -556,7 +549,6 @@ func TestAllAndSort(ctx context.Context, relays []Relay, n int, opts *Options) (
 	return available[:n], nil
 }
 
-// ClearCache clears the cached fastest relay
 func ClearCache() {
 	cachedRelayMu.Lock()
 	cachedRelay = nil

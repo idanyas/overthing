@@ -72,7 +72,7 @@ func (s *Server) Run(ctx context.Context) error {
 	}()
 
 	if s.config.RelayURI == "" {
-		uri, err := discoverRelay(ctx, s.config.Logger, nil)
+		uri, err := discoverRelay(ctx, s.config.Logger, s.config.Dialer, nil)
 		if err != nil {
 			return err
 		}
@@ -223,9 +223,17 @@ func (s *Server) generateDeviceIDWithHint(conn net.Conn) string {
 }
 
 func (s *Server) connectToRelay(ctx context.Context) (*tls.Conn, error) {
-	dialer := &net.Dialer{Timeout: 10 * time.Second}
+	var conn net.Conn
+	var err error
+
 	// Use pre-resolved s.relayAddr
-	conn, err := dialer.DialContext(ctx, "tcp", s.relayAddr)
+	if s.config.Dialer != nil {
+		conn, err = s.config.Dialer(ctx, "tcp", s.relayAddr)
+	} else {
+		dialer := &net.Dialer{Timeout: 10 * time.Second}
+		conn, err = dialer.DialContext(ctx, "tcp", s.relayAddr)
+	}
+
 	if err != nil {
 		return nil, fmt.Errorf("dial failed: %w", err)
 	}
@@ -376,8 +384,16 @@ func (s *Server) establishTunnel(ctx context.Context, inv protocol.Invitation) (
 		tunnelAddr = net.JoinHostPort(host, fmt.Sprintf("%d", inv.Port))
 	}
 
-	dialer := &net.Dialer{}
-	sessConn, err := dialer.DialContext(ctx, "tcp", tunnelAddr)
+	var sessConn net.Conn
+	var err error
+
+	if s.config.Dialer != nil {
+		sessConn, err = s.config.Dialer(ctx, "tcp", tunnelAddr)
+	} else {
+		dialer := &net.Dialer{}
+		sessConn, err = dialer.DialContext(ctx, "tcp", tunnelAddr)
+	}
+
 	if err != nil {
 		return nil, fmt.Errorf("session dial failed: %w", err)
 	}

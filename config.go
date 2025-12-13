@@ -1,9 +1,14 @@
 package tunnel
 
 import (
+	"context"
 	"net"
 	"time"
 )
+
+// DialerFunc represents a function that can dial a network connection.
+// It matches the signature of net.Dialer.DialContext.
+type DialerFunc func(ctx context.Context, network, address string) (net.Conn, error)
 
 // ServerConfig contains configuration options for a tunnel server.
 type ServerConfig struct {
@@ -25,6 +30,11 @@ type ServerConfig struct {
 	// Format: relay://host:port/?id=DEVICE-ID
 	// If empty, automatically discovers and uses the fastest available relay.
 	RelayURI string
+
+	// Dialer is an optional custom dialer for outgoing connections to the relay.
+	// Use this to bind to a specific network interface or route traffic through a proxy.
+	// If nil, standard net.Dialer is used.
+	Dialer DialerFunc
 
 	// ReconnectDelay is the delay between reconnection attempts.
 	// Default: 500ms
@@ -83,6 +93,11 @@ type ClientConfig struct {
 	// If empty and TargetID contains a hint, uses the hinted relay.
 	// If empty and no hint, automatically discovers relays.
 	RelayURI string
+
+	// Dialer is an optional custom dialer for outgoing connections to the relay.
+	// Use this to bind to a specific network interface or route traffic through a proxy.
+	// If nil, standard net.Dialer is used.
+	Dialer DialerFunc
 
 	// ReconnectDelay is the delay between reconnection attempts.
 	// Default: 500ms

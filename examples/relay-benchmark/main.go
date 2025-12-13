@@ -31,7 +31,7 @@ func main() {
 		fmt.Fprintln(os.Stderr, "Discovering Syncthing relays...")
 	}
 
-	relays, err := relay.Discover(ctx)
+	relays, err := relay.Discover(ctx, nil)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)

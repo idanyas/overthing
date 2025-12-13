@@ -347,7 +347,8 @@ func (c *Client) establishNewSession(ctx context.Context) (*yamux.Session, *tls.
 // scanAndConnect finds the target device and returns a ready tunnel connection
 func (c *Client) scanAndConnect(ctx context.Context) (net.Conn, string, error) {
 	c.log("info", "Fetching public relay list...")
-	relays, err := relay.Discover(ctx)
+	// EXPLICIT CAST FIX: Convert tunnel.DialerFunc to relay.Dialer
+	relays, err := relay.Discover(ctx, relay.Dialer(c.config.Dialer))
 	if err != nil {
 		return nil, "", fmt.Errorf("fetch relays: %w", err)
 	}
@@ -366,7 +367,6 @@ func (c *Client) scanAndConnect(ctx context.Context) (net.Conn, string, error) {
 	var found int32
 
 	// Reduce worker count to avoid network saturation and FD limits.
-	// 300 was too high causing connection timeouts.
 	workers := 100
 	if len(relays) < workers {
 		workers = len(relays)
@@ -438,7 +438,6 @@ func (c *Client) scanAndConnect(ctx context.Context) (net.Conn, string, error) {
 // tryRelayAndConnect connects to a relay, requests connection to target, and returns the tunnel
 func (c *Client) tryRelayAndConnect(ctx context.Context, r relay.Relay) (net.Conn, error) {
 	// Increased timeout to 15s to allow for full relay session establishment.
-	// Previous 5s was too short for the Server to receive invitation and dial back.
 	probeCtx, probeCancel := context.WithTimeout(ctx, 15*time.Second)
 	defer probeCancel()
 
@@ -448,8 +447,16 @@ func (c *Client) tryRelayAndConnect(ctx context.Context, r relay.Relay) (net.Con
 	}
 
 	addr := net.JoinHostPort(r.Host, r.Port)
-	dialer := &net.Dialer{}
-	conn, err := dialer.DialContext(probeCtx, "tcp", addr)
+
+	var conn net.Conn
+
+	if c.config.Dialer != nil {
+		conn, err = c.config.Dialer(probeCtx, "tcp", addr)
+	} else {
+		dialer := &net.Dialer{}
+		conn, err = dialer.DialContext(probeCtx, "tcp", addr)
+	}
+
 	if err != nil {
 		return nil, err
 	}
@@ -554,7 +561,15 @@ func (c *Client) tryRelayAndConnect(ctx context.Context, r relay.Relay) (net.Con
 				sessionAddr = net.JoinHostPort(host, fmt.Sprintf("%d", inv.Port))
 			}
 
-			sConn, err := net.DialTimeout("tcp", sessionAddr, 5*time.Second)
+			var sConn net.Conn
+
+			if c.config.Dialer != nil {
+				sConn, err = c.config.Dialer(ctx, "tcp", sessionAddr)
+			} else {
+				dialer := &net.Dialer{Timeout: 5 * time.Second}
+				sConn, err = dialer.DialContext(ctx, "tcp", sessionAddr)
+			}
+
 			if err != nil {
 				return nil, err
 			}
@@ -662,7 +677,14 @@ func (c *Client) connectToKnownRelay(ctx context.Context) (net.Conn, error) {
 				sessionAddr = net.JoinHostPort(host, fmt.Sprintf("%d", inv.Port))
 			}
 
-			sConn, err := net.DialTimeout("tcp", sessionAddr, 10*time.Second)
+			var sConn net.Conn
+			if c.config.Dialer != nil {
+				sConn, err = c.config.Dialer(ctx, "tcp", sessionAddr)
+			} else {
+				dialer := &net.Dialer{Timeout: 10 * time.Second}
+				sConn, err = dialer.DialContext(ctx, "tcp", sessionAddr)
+			}
+
 			if err != nil {
 				return nil, fmt.Errorf("session dial failed: %w", err)
 			}
@@ -743,8 +765,16 @@ func (c *Client) completeBEPHandshake(tunnelConn net.Conn) (*yamux.Session, *tls
 }
 
 func (c *Client) connectToRelay(ctx context.Context) (*tls.Conn, error) {
-	dialer := &net.Dialer{Timeout: 10 * time.Second}
-	conn, err := dialer.DialContext(ctx, "tcp", c.relayAddr)
+	var conn net.Conn
+	var err error
+
+	if c.config.Dialer != nil {
+		conn, err = c.config.Dialer(ctx, "tcp", c.relayAddr)
+	} else {
+		dialer := &net.Dialer{Timeout: 10 * time.Second}
+		conn, err = dialer.DialContext(ctx, "tcp", c.relayAddr)
+	}
+
 	if err != nil {
 		return nil, fmt.Errorf("dial failed: %w", err)
 	}
