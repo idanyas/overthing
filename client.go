@@ -15,10 +15,10 @@ import (
 
 	"github.com/hashicorp/yamux"
 
-	"tunnel/pkg/network"
-	"tunnel/pkg/protocol"
-	"tunnel/pkg/relay"
-	"tunnel/pkg/security"
+	"github.com/idanyas/overthing/pkg/network"
+	"github.com/idanyas/overthing/pkg/protocol"
+	"github.com/idanyas/overthing/pkg/relay"
+	"github.com/idanyas/overthing/pkg/security"
 )
 
 type Client struct {
@@ -224,7 +224,7 @@ func (c *Client) getSessionWithGen(ctx context.Context) (*yamux.Session, uint64,
 	c.muxMu.RLock()
 	session := c.session
 	gen := c.sessionGen
-	
+
 	if session != nil && !session.IsClosed() {
 		c.muxMu.RUnlock()
 		return session, gen, nil
@@ -309,12 +309,12 @@ func (c *Client) establishNewSession(ctx context.Context) (*yamux.Session, *tls.
 		tunnelConn, err = c.connectToKnownRelay(ctx)
 		if err != nil {
 			c.log("warn", fmt.Sprintf("Connection attempt %d failed: %v", attempt+1, err))
-			
+
 			if attempt < 2 {
 				time.Sleep(time.Duration(attempt+1) * 200 * time.Millisecond)
 				continue
 			}
-			
+
 			// If not a fixed relay, try rescanning
 			if !c.isFixedRelay {
 				c.log("info", "Clearing cached relay to re-scan...")
@@ -330,7 +330,7 @@ func (c *Client) establishNewSession(ctx context.Context) (*yamux.Session, *tls.
 		if err != nil {
 			tunnelConn.Close()
 			c.log("warn", fmt.Sprintf("Handshake attempt %d failed: %v", attempt+1, err))
-			
+
 			if attempt < 2 {
 				time.Sleep(time.Duration(attempt+1) * 200 * time.Millisecond)
 				continue

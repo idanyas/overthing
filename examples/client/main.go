@@ -10,7 +10,7 @@ import (
 	"os/signal"
 	"strings"
 
-	"tunnel"
+	"github.com/idanyas/overthing"
 )
 
 func main() {

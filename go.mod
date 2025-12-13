@@ -1,4 +1,4 @@
-module tunnel
+module github.com/idanyas/overthing
 
 go 1.21
 

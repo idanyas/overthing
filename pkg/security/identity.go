@@ -16,7 +16,7 @@ import (
 	"strings"
 	"time"
 
-	"tunnel/pkg/logging"
+	"github.com/idanyas/overthing/pkg/logging"
 )
 
 // IMPORTANT - COMPACT ID ENCODING - DO NOT MODIFY:
@@ -99,27 +99,27 @@ func JoinRelayHint(id string, ip net.IP, port int) string {
 		num := new(big.Int).SetBytes(buf)
 		mod := new(big.Int)
 		var out []byte
-		
+
 		// Encode to Base63
 		for num.Cmp(bigZero) > 0 {
 			num.DivMod(num, big63, mod)
 			out = append(out, compactAlphabet[mod.Int64()])
 		}
-		
+
 		targetLen := 8
 		if len(buf) > 6 {
 			targetLen = 25
 		}
-		
+
 		for len(out) < targetLen {
 			out = append(out, 'A')
 		}
-		
+
 		// Reverse
 		for i, j := 0, len(out)-1; i < j; i, j = i+1, j-1 {
 			out[i], out[j] = out[j], out[i]
 		}
-		
+
 		return id + string(out)
 	}
 
@@ -138,11 +138,11 @@ func SplitRelayHint(s string) (cleanID string, ip net.IP, port int, ok bool) {
 	// 1. Compact + Hint
 	if len(s) > compactEncodedLen && strings.HasPrefix(s, s[:compactEncodedLen]) {
 		suffix := s[compactEncodedLen:]
-		
+
 		// We expect length 8 (IPv4) or 25 (IPv6)
 		if len(suffix) == 8 || len(suffix) == 25 {
 			cleanID = s[:compactEncodedLen]
-			
+
 			// Decode Base63
 			num := new(big.Int)
 			for _, c := range suffix {
@@ -153,7 +153,7 @@ func SplitRelayHint(s string) (cleanID string, ip net.IP, port int, ok bool) {
 				num.Mul(num, big63)
 				num.Add(num, big.NewInt(int64(idx)))
 			}
-			
+
 			buf := num.Bytes()
 			// Pad back to 6 or 18 bytes if leading zeros were dropped
 			if len(suffix) == 8 && len(buf) < 6 {
@@ -165,7 +165,7 @@ func SplitRelayHint(s string) (cleanID string, ip net.IP, port int, ok bool) {
 				copy(padded[18-len(buf):], buf)
 				buf = padded
 			}
-			
+
 			if len(buf) == 6 {
 				return decodePackedIPPort(cleanID, buf)
 			} else if len(buf) == 18 {
@@ -177,12 +177,12 @@ func SplitRelayHint(s string) (cleanID string, ip net.IP, port int, ok bool) {
 StandardCheck:
 	// 2. Standard + Hint
 	noDashes := strings.ReplaceAll(s, "-", "")
-	
+
 	if len(noDashes) == standardIDLen+10 || len(noDashes) == standardIDLen+29 {
 		hintLen := len(noDashes) - standardIDLen
 		suffix := s[len(s)-hintLen:] // works because dashes are only in the ID part
 		cleanID = s[:len(s)-hintLen]
-		
+
 		buf, err := base32.StdEncoding.WithPadding(base32.NoPadding).DecodeString(suffix)
 		if err == nil && (len(buf) == 6 || len(buf) == 18) {
 			return decodePackedIPPort(cleanID, buf)
@@ -299,11 +299,11 @@ func GenerateIdentityFromSeed(seed []byte) (tls.Certificate, string, string) {
 	publicKey := privateKey.Public().(ed25519.PublicKey)
 
 	epoch := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
-	
+
 	template := x509.Certificate{
 		SerialNumber: big.NewInt(1),
 		NotBefore:    epoch,
-		NotAfter:     epoch.Add(20 * 365 * 24 * time.Hour), 
+		NotAfter:     epoch.Add(20 * 365 * 24 * time.Hour),
 		KeyUsage:     x509.KeyUsageDigitalSignature,
 	}
 
@@ -346,7 +346,7 @@ func GetDeviceIDCompact(certDER []byte) string {
 
 func DeviceIDFromString(id string) ([]byte, error) {
 	id = strings.TrimSpace(id)
-	
+
 	// Handle Hint stripping
 	if cleanID, _, _, ok := SplitRelayHint(id); ok {
 		id = cleanID
@@ -363,7 +363,7 @@ func DeviceIDFromString(id string) ([]byte, error) {
 	// Standard ID - Validate Checksums
 	noDashes := strings.ReplaceAll(id, "-", "")
 	normalized := NormalizeID(noDashes)
-	
+
 	if len(normalized) == 56 {
 		// Validate Luhn Checksums
 		for i := 0; i < 4; i++ {
@@ -381,7 +381,7 @@ func DeviceIDFromString(id string) ([]byte, error) {
 
 func luhn32CheckDigit(s string) rune {
 	const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567"
-	
+
 	factor := 1
 	sum := 0
 
@@ -389,11 +389,11 @@ func luhn32CheckDigit(s string) rune {
 	for _, r := range s {
 		codepoint := strings.IndexRune(alphabet, r)
 		if codepoint == -1 {
-			continue 
+			continue
 		}
 
 		addend := factor * codepoint
-		
+
 		if factor == 2 {
 			factor = 1
 		} else {

@@ -16,9 +16,9 @@ import (
 
 	"github.com/hashicorp/yamux"
 
-	"tunnel/pkg/network"
-	"tunnel/pkg/protocol"
-	"tunnel/pkg/security"
+	"github.com/idanyas/overthing/pkg/network"
+	"github.com/idanyas/overthing/pkg/protocol"
+	"github.com/idanyas/overthing/pkg/security"
 )
 
 type Server struct {
@@ -351,7 +351,7 @@ func (s *Server) handleTunnel(ctx context.Context, inv protocol.Invitation) {
 					<-s.streamSem
 					atomic.AddInt64(&s.activeConns, -1)
 				}()
-				s.handleStream(stream, clientID)
+				s.handleStream(stream)
 			}(stream)
 		case <-ctx.Done():
 			stream.Close()
@@ -446,7 +446,7 @@ func (s *Server) establishTunnel(ctx context.Context, inv protocol.Invitation) (
 	return bepConn, nil
 }
 
-func (s *Server) handleStream(stream net.Conn, clientID string) {
+func (s *Server) handleStream(stream net.Conn) {
 	defer stream.Close()
 
 	var targetConn net.Conn

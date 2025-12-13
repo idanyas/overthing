@@ -27,7 +27,7 @@ package tunnel
 import (
 	"crypto/tls"
 
-	"tunnel/pkg/security"
+	"github.com/idanyas/overthing/pkg/security"
 )
 
 // Version is the current version of the tunnel library.

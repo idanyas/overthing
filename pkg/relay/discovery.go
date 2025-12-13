@@ -13,7 +13,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"tunnel/pkg/security"
+	"github.com/idanyas/overthing/pkg/security"
 )
 
 const (
@@ -162,7 +162,7 @@ func Discover(ctx context.Context) ([]Relay, error) {
 	if err != nil {
 		return nil, fmt.Errorf("create request: %w", err)
 	}
-	req.Header.Set("User-Agent", "tunnel/1.0")
+	req.Header.Set("User-Agent", "github.com/idanyas/overthing/1.0")
 
 	client := &http.Client{Timeout: 30 * time.Second}
 	resp, err := client.Do(req)

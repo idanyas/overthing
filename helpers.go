@@ -10,8 +10,8 @@ import (
 
 	"github.com/hashicorp/yamux"
 
-	"tunnel/pkg/relay"
-	"tunnel/pkg/security"
+	"github.com/idanyas/overthing/pkg/relay"
+	"github.com/idanyas/overthing/pkg/security"
 )
 
 func parseRelayURI(uri string) (addr string, deviceID string, err error) {
@@ -57,7 +57,7 @@ func formatDeviceIDShort(raw []byte) string {
 func defaultYamuxConfig() *yamux.Config {
 	cfg := yamux.DefaultConfig()
 	cfg.AcceptBacklog = 256
-	cfg.EnableKeepAlive = false 
+	cfg.EnableKeepAlive = false
 	cfg.KeepAliveInterval = 15 * time.Second
 	cfg.ConnectionWriteTimeout = 10 * time.Second
 	// 4MB Window: Prevents throughput collapse on high-latency links.
