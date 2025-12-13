@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/url"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/hashicorp/yamux"
@@ -24,7 +25,7 @@ type Client struct {
 	config      ClientConfig
 	tlsConfig   *tls.Config
 	targetBytes []byte
-	
+
 	relayAddr    string
 	relayID      string
 	isFixedRelay bool
@@ -34,10 +35,10 @@ type Client struct {
 	cancel   context.CancelFunc
 	listener net.Listener
 
-	muxMu     sync.Mutex
-	session   *yamux.Session
-	bepConn   *tls.Conn
-	lastError time.Time
+	muxMu      sync.RWMutex
+	session    *yamux.Session
+	bepConn    *tls.Conn
+	sessionGen uint64
 }
 
 func NewClient(config ClientConfig) (*Client, error) {
@@ -45,7 +46,7 @@ func NewClient(config ClientConfig) (*Client, error) {
 
 	cleanID, hintIP, hintPort, hasHint := security.SplitRelayHint(config.TargetID)
 	config.TargetID = cleanID
-	
+
 	targetBytes, err := security.DeviceIDFromString(config.TargetID)
 	if err != nil {
 		return nil, fmt.Errorf("invalid target device ID: %w", err)
@@ -139,10 +140,11 @@ func (c *Client) Run(ctx context.Context) error {
 	// Automatic Connectivity Test
 	go func() {
 		c.log("info", "Verifying connectivity to server...")
-		
+
 		testCtx, testCancel := context.WithTimeout(ctx, 30*time.Second)
 		defer testCancel()
 
+		// Force a session establishment
 		if _, err := c.getSession(testCtx); err != nil {
 			c.log("warn", fmt.Sprintf("Initial connection test failed: %v", err))
 			c.log("info", "Client will keep retrying when connections arrive...")
@@ -178,34 +180,33 @@ func (c *Client) Stop() {
 	}
 }
 
-func (c *Client) DeviceID() string {
-	return c.config.Identity.CompactID
-}
-
-func (c *Client) ListenAddr() string {
-	if c.listener != nil {
-		return c.listener.Addr().String()
-	}
-	return c.config.ListenAddr
-}
-
-func (c *Client) RelayURI() string {
-	return c.config.RelayURI
-}
-
 func (c *Client) handleConnection(ctx context.Context, localConn net.Conn) {
 	defer localConn.Close()
 
-	session, err := c.getSession(ctx)
-	if err != nil {
-		c.log("error", fmt.Sprintf("Session failed: %v", err))
-		return
+	// Attempt to open a stream. If the session is dead, we retry once.
+	var stream net.Conn
+	var err error
+	var session *yamux.Session
+	var sessionGen uint64
+
+	for retry := 0; retry < 2; retry++ {
+		session, sessionGen, err = c.getSessionWithGen(ctx)
+		if err != nil {
+			c.log("error", fmt.Sprintf("Session failed: %v", err))
+			return
+		}
+
+		stream, err = session.Open()
+		if err == nil {
+			break // Success
+		}
+
+		c.log("warn", fmt.Sprintf("Stream open failed (attempt %d): %v - invalidating session", retry+1, err))
+		c.invalidateSessionIfMatch(sessionGen)
 	}
 
-	stream, err := session.Open()
 	if err != nil {
-		c.log("warn", fmt.Sprintf("Stream open failed: %v - invalidating session", err))
-		c.invalidateSession(session)
+		c.log("error", fmt.Sprintf("Failed to open stream after retry: %v", err))
 		return
 	}
 	defer stream.Close()
@@ -214,27 +215,32 @@ func (c *Client) handleConnection(ctx context.Context, localConn net.Conn) {
 }
 
 func (c *Client) getSession(ctx context.Context) (*yamux.Session, error) {
+	session, _, err := c.getSessionWithGen(ctx)
+	return session, err
+}
+
+func (c *Client) getSessionWithGen(ctx context.Context) (*yamux.Session, uint64, error) {
+	// Fast path: check if we have a valid session without full lock
+	c.muxMu.RLock()
+	session := c.session
+	gen := c.sessionGen
+	
+	// OPTIMIZATION: We do NOT ping here. Assume session is healthy.
+	// If it's dead, session.Open() will fail, and we will retry in handleConnection.
+	// This saves 1 RTT per connection.
+	if session != nil && !session.IsClosed() {
+		c.muxMu.RUnlock()
+		return session, gen, nil
+	}
+	c.muxMu.RUnlock()
+
+	// Slow path: need to create new session
 	c.muxMu.Lock()
 	defer c.muxMu.Unlock()
 
-	// Check if existing session is healthy
+	// Double-check after acquiring write lock
 	if c.session != nil && !c.session.IsClosed() {
-		// Quick health check - try a ping with timeout
-		pingDone := make(chan error, 1)
-		go func() {
-			_, err := c.session.Ping()
-			pingDone <- err
-		}()
-		
-		select {
-		case err := <-pingDone:
-			if err == nil {
-				return c.session, nil
-			}
-			c.log("warn", fmt.Sprintf("Session ping failed: %v - reconnecting", err))
-		case <-time.After(2 * time.Second):
-			c.log("warn", "Session ping timeout - reconnecting")
-		}
+		return c.session, c.sessionGen, nil
 	}
 
 	// Clean up old session
@@ -247,131 +253,126 @@ func (c *Client) getSession(ctx context.Context) (*yamux.Session, error) {
 		c.bepConn = nil
 	}
 
-	if time.Since(c.lastError) < 100*time.Millisecond {
-		time.Sleep(100 * time.Millisecond)
+	// Try to establish session
+	session, bepConn, err := c.establishNewSession(ctx)
+	if err != nil {
+		return nil, 0, err
 	}
 
-	for {
+	c.session = session
+	c.bepConn = bepConn
+	c.sessionGen++
+
+	c.log("ok", "Tunnel established")
+	if c.config.OnTunnelEstablished != nil {
+		c.config.OnTunnelEstablished()
+	}
+
+	return session, c.sessionGen, nil
+}
+
+func (c *Client) establishNewSession(ctx context.Context) (*yamux.Session, *tls.Conn, error) {
+	var tunnelConn net.Conn
+	var err error
+
+	// If no relay configured, scan to find one
+	if c.config.RelayURI == "" {
+		if c.isFixedRelay {
+			return nil, nil, errors.New("relay URI missing in fixed configuration")
+		}
+
+		c.log("info", "Scanning network for target device...")
+		tunnelConn, relayURI, err := c.scanAndConnect(ctx)
+		if err != nil {
+			return nil, nil, fmt.Errorf("discovery failed: %w", err)
+		}
+
+		// Save the discovered relay for future reconnections
+		c.config.RelayURI = relayURI
+		c.relayAddr, c.relayID, _ = parseRelayURI(relayURI)
+
+		// Complete BEP handshake
+		session, bepConn, err := c.completeBEPHandshake(tunnelConn)
+		if err != nil {
+			tunnelConn.Close()
+			return nil, nil, err
+		}
+
+		return session, bepConn, nil
+	}
+
+	// Connect to known relay with retries
+	for attempt := 0; attempt < 3; attempt++ {
 		select {
 		case <-ctx.Done():
-			return nil, ctx.Err()
+			return nil, nil, ctx.Err()
 		default:
 		}
 
-		// If no relay configured, scan to find one (lightweight probe)
-		if c.config.RelayURI == "" {
-			if c.isFixedRelay {
-				return nil, errors.New("relay URI missing in fixed configuration")
-			}
-			
-			c.log("info", "Scanning network for target device...")
-			uri, err := c.scanRelays(ctx)
-			if err != nil {
-				c.lastError = time.Now()
-				return nil, fmt.Errorf("discovery failed: %w", err)
-			}
-			
-			c.config.RelayURI = uri
-			c.relayAddr, c.relayID, _ = parseRelayURI(uri)
-		}
-
-		// Now connect to the known relay and establish session
-		tunnelConn, err := c.connectAndEstablishSession(ctx)
+		tunnelConn, err = c.connectToKnownRelay(ctx)
 		if err != nil {
-			c.log("warn", fmt.Sprintf("Connection failed: %v", err))
+			c.log("warn", fmt.Sprintf("Connection attempt %d failed: %v", attempt+1, err))
 			
+			if attempt < 2 {
+				time.Sleep(time.Duration(attempt+1) * 200 * time.Millisecond)
+				continue
+			}
+			
+			// If not a fixed relay, try rescanning
 			if !c.isFixedRelay {
 				c.log("info", "Clearing cached relay to re-scan...")
 				c.config.RelayURI = ""
 				c.relayAddr = ""
 				c.relayID = ""
-				continue
+				return c.establishNewSession(ctx) // Recursive call to scan
 			}
-			c.lastError = time.Now()
-			return nil, err
+			return nil, nil, err
 		}
 
-		// BEP TLS handshake over the tunnel connection
-		bepConfig := &tls.Config{
-			Certificates:       []tls.Certificate{c.config.Identity.Certificate},
-			NextProtos:         []string{"bep/1.0"},
-			MinVersion:         tls.VersionTLS13,
-			InsecureSkipVerify: true,
-			VerifyPeerCertificate: func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
-				if len(rawCerts) == 0 {
-					return errors.New("no peer certificate")
-				}
-				remoteBytes := security.GetDeviceIDBytes(rawCerts[0])
-				if len(remoteBytes) != len(c.targetBytes) {
-					return errors.New("ID length mismatch")
-				}
-				for i := range remoteBytes {
-					if remoteBytes[i] != c.targetBytes[i] {
-						return fmt.Errorf("device ID mismatch")
-					}
-				}
-				return nil
-			},
-		}
-
-		bepConn := tls.Client(tunnelConn, bepConfig)
-
-		bepConn.SetDeadline(time.Now().Add(15 * time.Second))
-		if err := bepConn.Handshake(); err != nil {
-			tunnelConn.Close()
-			c.lastError = time.Now()
-			
-			if !c.isFixedRelay {
-				c.config.RelayURI = ""
-				continue
-			}
-			return nil, fmt.Errorf("BEP handshake failed: %w", err)
-		}
-		bepConn.SetDeadline(time.Time{})
-
-		session, err := yamux.Client(bepConn, defaultYamuxConfig())
+		session, bepConn, err := c.completeBEPHandshake(tunnelConn)
 		if err != nil {
-			bepConn.Close()
-			c.lastError = time.Now()
-			return nil, err
+			tunnelConn.Close()
+			c.log("warn", fmt.Sprintf("Handshake attempt %d failed: %v", attempt+1, err))
+			
+			if attempt < 2 {
+				time.Sleep(time.Duration(attempt+1) * 200 * time.Millisecond)
+				continue
+			}
+			return nil, nil, err
 		}
 
-		c.session = session
-		c.bepConn = bepConn
-
-		c.log("ok", "Tunnel established")
-		if c.config.OnTunnelEstablished != nil {
-			c.config.OnTunnelEstablished()
-		}
-
-		return session, nil
+		return session, bepConn, nil
 	}
+
+	return nil, nil, errors.New("failed to establish session after retries")
 }
 
-// scanRelays does a lightweight probe to find which relay has the target
-func (c *Client) scanRelays(ctx context.Context) (string, error) {
+// scanAndConnect finds the target device and returns a ready tunnel connection
+func (c *Client) scanAndConnect(ctx context.Context) (net.Conn, string, error) {
 	c.log("info", "Fetching public relay list...")
 	relays, err := relay.Discover(ctx)
 	if err != nil {
-		return "", fmt.Errorf("fetch relays: %w", err)
+		return nil, "", fmt.Errorf("fetch relays: %w", err)
 	}
 
 	c.log("info", fmt.Sprintf("Scanning %d relays for device %x...", len(relays), c.targetBytes[:4]))
 
 	type result struct {
-		uri string
-		err error
+		conn     net.Conn
+		relayURI string
 	}
 
 	results := make(chan result, 1)
 	scanCtx, scanCancel := context.WithCancel(ctx)
 	defer scanCancel()
 
+	var found int32
+
 	workers := 300
 	if len(relays) < workers {
 		workers = len(relays)
 	}
-	
+
 	work := make(chan relay.Relay, len(relays))
 	for _, r := range relays {
 		work <- r
@@ -385,20 +386,32 @@ func (c *Client) scanRelays(ctx context.Context) (string, error) {
 		go func() {
 			defer wg.Done()
 			for r := range work {
+				if atomic.LoadInt32(&found) != 0 {
+					return
+				}
+
 				select {
 				case <-scanCtx.Done():
 					return
 				default:
 				}
 
-				if c.probeRelay(scanCtx, r) {
+				conn, err := c.tryRelayAndConnect(scanCtx, r)
+				if err != nil {
+					continue
+				}
+
+				if atomic.CompareAndSwapInt32(&found, 0, 1) {
 					select {
-					case results <- result{uri: r.URL}:
+					case results <- result{conn: conn, relayURI: r.URL}:
 						scanCancel()
 					default:
+						conn.Close()
 					}
-					return
+				} else {
+					conn.Close()
 				}
+				return
 			}
 		}()
 	}
@@ -411,61 +424,62 @@ func (c *Client) scanRelays(ctx context.Context) (string, error) {
 	select {
 	case res, ok := <-results:
 		if !ok {
-			return "", errors.New("target device not found on any relay")
+			return nil, "", errors.New("target device not found on any relay")
 		}
-		if res.err != nil {
-			return "", res.err
-		}
-		
-		u, _ := url.Parse(res.uri)
+
+		u, _ := url.Parse(res.relayURI)
 		c.log("ok", fmt.Sprintf("Found device on relay: %s", u.Host))
-		
-		return res.uri, nil
+
+		return res.conn, res.relayURI, nil
 	case <-ctx.Done():
-		return "", ctx.Err()
+		return nil, "", ctx.Err()
 	}
 }
 
-// probeRelay checks if target device is on this relay WITHOUT establishing a session
-func (c *Client) probeRelay(ctx context.Context, r relay.Relay) bool {
-	probeCtx, probeCancel := context.WithTimeout(ctx, 2500*time.Millisecond)
+// tryRelayAndConnect connects to a relay, requests connection to target, and returns the tunnel
+func (c *Client) tryRelayAndConnect(ctx context.Context, r relay.Relay) (net.Conn, error) {
+	probeCtx, probeCancel := context.WithTimeout(ctx, 5*time.Second)
 	defer probeCancel()
 
 	host, _, err := net.SplitHostPort(r.Host)
 	if err != nil {
 		host = r.Host
 	}
-	
+
 	addr := net.JoinHostPort(r.Host, r.Port)
 	dialer := &net.Dialer{}
 	conn, err := dialer.DialContext(probeCtx, "tcp", addr)
 	if err != nil {
-		return false
+		return nil, err
 	}
-	defer conn.Close()
 
 	if deadline, ok := probeCtx.Deadline(); ok {
 		conn.SetDeadline(deadline)
 	}
 
+	network.OptimizeConn(conn)
+
 	tlsConfig := c.tlsConfig.Clone()
 	tlsConfig.ServerName = host
-	
+
 	tlsConn := tls.Client(conn, tlsConfig)
 	if err := tlsConn.Handshake(); err != nil {
-		return false
+		conn.Close()
+		return nil, err
 	}
 
 	// Join relay
 	if err := protocol.WriteMessage(tlsConn, protocol.MsgJoinRelayRequest, []byte{0, 0, 0, 0}); err != nil {
-		return false
+		tlsConn.Close()
+		return nil, err
 	}
-	
+
 	// Read Join Response
 	for {
 		msgType, body, err := protocol.ReadMessage(tlsConn)
 		if err != nil {
-			return false
+			tlsConn.Close()
+			return nil, err
 		}
 		if msgType == protocol.MsgPing {
 			protocol.WriteMessage(tlsConn, protocol.MsgPong, nil)
@@ -473,47 +487,114 @@ func (c *Client) probeRelay(ctx context.Context, r relay.Relay) bool {
 		}
 		if msgType == protocol.MsgResponse {
 			if len(body) >= 4 && int32(binary.BigEndian.Uint32(body[:4])) != 0 {
-				return false
+				tlsConn.Close()
+				return nil, errors.New("join rejected")
 			}
 			break
 		}
-		return false
+		tlsConn.Close()
+		return nil, errors.New("unexpected message")
 	}
 
 	// Send Connect Request
 	if err := protocol.WriteMessage(tlsConn, protocol.MsgConnectRequest, protocol.XDRBytes(c.targetBytes)); err != nil {
-		return false
+		tlsConn.Close()
+		return nil, err
 	}
 
-	// Wait for invitation or rejection - this is just a probe, we don't accept
+	// Wait for invitation
 	for {
 		msgType, body, err := protocol.ReadMessage(tlsConn)
 		if err != nil {
-			return false
+			tlsConn.Close()
+			return nil, err
 		}
-		
+
 		if msgType == protocol.MsgPing {
 			protocol.WriteMessage(tlsConn, protocol.MsgPong, nil)
 			continue
 		}
 
-		if msgType == protocol.MsgSessionInvitation {
-			// Device found! Close connection, we'll connect properly later
-			return true
+		if msgType == protocol.MsgResponse {
+			tlsConn.Close()
+			return nil, errors.New("target not found")
 		}
 
-		if msgType == protocol.MsgResponse {
-			if len(body) >= 4 && int32(binary.BigEndian.Uint32(body[:4])) == 0 {
-				return true
+		if msgType == protocol.MsgSessionInvitation {
+			inv, err := protocol.DecodeInvitation(body)
+			if err != nil {
+				tlsConn.Close()
+				return nil, err
 			}
-			return false
+
+			// Verify invitation is from our target
+			if len(inv.From) != len(c.targetBytes) {
+				continue
+			}
+			match := true
+			for i := range inv.From {
+				if inv.From[i] != c.targetBytes[i] {
+					match = false
+					break
+				}
+			}
+			if !match {
+				continue
+			}
+
+			// Close relay connection - we're done with it
+			tlsConn.Close()
+
+			// Connect to session
+			var sessionAddr string
+			if len(inv.Address) > 0 && !net.IP(inv.Address).IsUnspecified() {
+				sessionAddr = net.JoinHostPort(net.IP(inv.Address).String(), fmt.Sprintf("%d", inv.Port))
+			} else {
+				sessionAddr = net.JoinHostPort(host, fmt.Sprintf("%d", inv.Port))
+			}
+
+			sConn, err := net.DialTimeout("tcp", sessionAddr, 5*time.Second)
+			if err != nil {
+				return nil, err
+			}
+			network.OptimizeConn(sConn)
+
+			if err := protocol.WriteMessage(sConn, protocol.MsgJoinSessionRequest, protocol.XDRBytes(inv.Key)); err != nil {
+				sConn.Close()
+				return nil, err
+			}
+
+			sConn.SetReadDeadline(time.Now().Add(5 * time.Second))
+			mType, mBody, err := protocol.ReadMessage(sConn)
+			sConn.SetReadDeadline(time.Time{})
+
+			if err != nil {
+				sConn.Close()
+				return nil, err
+			}
+
+			if mType != protocol.MsgResponse {
+				sConn.Close()
+				return nil, errors.New("unexpected response")
+			}
+
+			if len(mBody) >= 4 {
+				if code := int32(binary.BigEndian.Uint32(mBody[:4])); code != 0 {
+					sConn.Close()
+					return nil, fmt.Errorf("session rejected: %d", code)
+				}
+			}
+
+			return sConn, nil
 		}
-		return false
+
+		tlsConn.Close()
+		return nil, errors.New("unexpected message")
 	}
 }
 
-// connectAndEstablishSession connects to known relay and establishes session
-func (c *Client) connectAndEstablishSession(ctx context.Context) (net.Conn, error) {
+// connectToKnownRelay connects to a known relay and returns the tunnel connection
+func (c *Client) connectToKnownRelay(ctx context.Context) (net.Conn, error) {
 	relayConn, err := c.connectToRelay(ctx)
 	if err != nil {
 		return nil, err
@@ -525,7 +606,7 @@ func (c *Client) connectAndEstablishSession(ctx context.Context) (net.Conn, erro
 	}
 
 	for {
-		relayConn.SetReadDeadline(time.Now().Add(60 * time.Second))
+		relayConn.SetReadDeadline(time.Now().Add(30 * time.Second))
 		msgType, body, err := protocol.ReadMessage(relayConn)
 		if err != nil {
 			relayConn.Close()
@@ -554,7 +635,7 @@ func (c *Client) connectAndEstablishSession(ctx context.Context) (net.Conn, erro
 				relayConn.Close()
 				return nil, err
 			}
-			
+
 			// Verify invitation
 			if len(inv.From) != len(c.targetBytes) {
 				continue
@@ -611,13 +692,53 @@ func (c *Client) connectAndEstablishSession(ctx context.Context) (net.Conn, erro
 					return nil, fmt.Errorf("session rejected: code %d", code)
 				}
 			}
-			
+
 			return sConn, nil
 		}
 
 		relayConn.Close()
 		return nil, fmt.Errorf("unexpected message: %d", msgType)
 	}
+}
+
+func (c *Client) completeBEPHandshake(tunnelConn net.Conn) (*yamux.Session, *tls.Conn, error) {
+	bepConfig := &tls.Config{
+		Certificates:       []tls.Certificate{c.config.Identity.Certificate},
+		NextProtos:         []string{"bep/1.0"},
+		MinVersion:         tls.VersionTLS13,
+		InsecureSkipVerify: true,
+		VerifyPeerCertificate: func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
+			if len(rawCerts) == 0 {
+				return errors.New("no peer certificate")
+			}
+			remoteBytes := security.GetDeviceIDBytes(rawCerts[0])
+			if len(remoteBytes) != len(c.targetBytes) {
+				return errors.New("ID length mismatch")
+			}
+			for i := range remoteBytes {
+				if remoteBytes[i] != c.targetBytes[i] {
+					return errors.New("device ID mismatch")
+				}
+			}
+			return nil
+		},
+	}
+
+	bepConn := tls.Client(tunnelConn, bepConfig)
+
+	bepConn.SetDeadline(time.Now().Add(10 * time.Second))
+	if err := bepConn.Handshake(); err != nil {
+		return nil, nil, fmt.Errorf("BEP handshake failed: %w", err)
+	}
+	bepConn.SetDeadline(time.Time{})
+
+	session, err := yamux.Client(bepConn, defaultYamuxConfig())
+	if err != nil {
+		bepConn.Close()
+		return nil, nil, fmt.Errorf("yamux setup failed: %w", err)
+	}
+
+	return session, bepConn, nil
 }
 
 func (c *Client) connectToRelay(ctx context.Context) (*tls.Conn, error) {
@@ -631,7 +752,7 @@ func (c *Client) connectToRelay(ctx context.Context) (*tls.Conn, error) {
 
 	tlsConn := tls.Client(conn, c.tlsConfig)
 
-	tlsConn.SetDeadline(time.Now().Add(15 * time.Second))
+	tlsConn.SetDeadline(time.Now().Add(10 * time.Second))
 	if err := tlsConn.Handshake(); err != nil {
 		conn.Close()
 		return nil, fmt.Errorf("TLS failed: %w", err)
@@ -679,23 +800,26 @@ func (c *Client) connectToRelay(ctx context.Context) (*tls.Conn, error) {
 	return tlsConn, nil
 }
 
-func (c *Client) invalidateSession(session *yamux.Session) {
+func (c *Client) invalidateSessionIfMatch(gen uint64) {
 	c.muxMu.Lock()
 	defer c.muxMu.Unlock()
-	if c.session == session {
-		if c.session != nil {
-			c.session.Close()
-		}
+
+	if c.sessionGen != gen {
+		return // Session already replaced
+	}
+
+	if c.session != nil {
+		c.session.Close()
 		c.session = nil
-		if c.bepConn != nil {
-			c.bepConn.Close()
-			c.bepConn = nil
-		}
-		c.lastError = time.Now()
-		c.log("info", "Session invalidated, will reconnect on next request")
-		if c.config.OnTunnelLost != nil {
-			c.config.OnTunnelLost(errors.New("session invalidated"))
-		}
+	}
+	if c.bepConn != nil {
+		c.bepConn.Close()
+		c.bepConn = nil
+	}
+
+	c.log("info", "Session invalidated, will reconnect on next request")
+	if c.config.OnTunnelLost != nil {
+		c.config.OnTunnelLost(errors.New("session invalidated"))
 	}
 }
 

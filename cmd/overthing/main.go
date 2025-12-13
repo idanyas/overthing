@@ -92,7 +92,7 @@ func runServer(args []string) {
 
 func runClient(args []string) {
 	fs := flag.NewFlagSet("client", flag.ExitOnError)
-	targetIDFlag := fs.String("target-id", "", "Server Device ID (with or without relay hint)")
+	targetIDFlag := fs.String("target", "", "Server Device ID (with or without relay hint)")
 	listenAddr := fs.String("listen", "127.0.0.1:2222", "Local address to listen on")
 	identityFile := fs.String("identity", "", "Identity key file (ephemeral if empty)")
 	relayURI := fs.String("relay", "", "Relay URI (uses hint from ID if empty)")

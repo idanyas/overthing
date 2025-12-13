@@ -32,9 +32,9 @@ type Server struct {
 	mu      sync.Mutex
 	running bool
 	cancel  context.CancelFunc
-	
-	streamSem    chan struct{}
-	activeConns  int64
+
+	streamSem   chan struct{}
+	activeConns int64
 }
 
 func NewServer(config ServerConfig) (*Server, error) {
@@ -47,7 +47,7 @@ func NewServer(config ServerConfig) (*Server, error) {
 		MinVersion:         tls.VersionTLS13,
 		MaxVersion:         tls.VersionTLS13,
 	}
-	
+
 	streamSem := make(chan struct{}, 1024)
 
 	return &Server{
@@ -217,7 +217,7 @@ func (s *Server) generateDeviceIDWithHint(conn net.Conn) string {
 		s.log("warn", fmt.Sprintf("Cannot parse relay IP %q for hint", host))
 		return s.DeviceID()
 	}
-	
+
 	idWithHint := security.JoinRelayHint(s.DeviceID(), ip, port)
 
 	if len(idWithHint) == len(s.DeviceID()) {
@@ -287,14 +287,19 @@ func (s *Server) connectToRelay(ctx context.Context) (*tls.Conn, error) {
 
 func (s *Server) handleTunnel(ctx context.Context, inv protocol.Invitation) {
 	clientID := formatDeviceIDShort(inv.From)
-	
-	// Use shorter timeout for tunnel establishment
-	establishCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+
+	// Use shorter timeout for tunnel establishment - faster failure for stale invitations
+	establishCtx, cancel := context.WithTimeout(ctx, 8*time.Second)
 	bepConn, err := s.establishTunnel(establishCtx, inv)
 	cancel()
-	
+
 	if err != nil {
-		s.log("error", fmt.Sprintf("Tunnel setup failed for %s: %v", clientID, err))
+		// Don't log timeout errors as ERROR - they're expected for stale invitations
+		if strings.Contains(err.Error(), "timeout") || strings.Contains(err.Error(), "i/o timeout") {
+			s.log("info", fmt.Sprintf("Tunnel setup timed out for %s (likely stale invitation)", clientID))
+		} else {
+			s.log("error", fmt.Sprintf("Tunnel setup failed for %s: %v", clientID, err))
+		}
 		return
 	}
 
@@ -352,14 +357,14 @@ func (s *Server) handleTunnel(ctx context.Context, inv protocol.Invitation) {
 			}
 			return
 		}
-		
+
 		atomic.AddInt64(&s.activeConns, 1)
-		
+
 		select {
 		case s.streamSem <- struct{}{}:
 			go func(stream net.Conn) {
-				defer func() { 
-					<-s.streamSem 
+				defer func() {
+					<-s.streamSem
 					atomic.AddInt64(&s.activeConns, -1)
 				}()
 				s.handleStream(stream, clientID)
@@ -459,7 +464,7 @@ func (s *Server) establishTunnel(ctx context.Context, inv protocol.Invitation) (
 		sessConn.Close()
 		return nil, fmt.Errorf("TLS handshake failed: %w", err)
 	}
-	
+
 	// Clear deadline after successful handshake
 	sessConn.SetDeadline(time.Time{})
 
@@ -475,7 +480,7 @@ func (s *Server) handleStream(stream net.Conn, clientID string) {
 	if s.config.TargetDialer != nil {
 		targetConn, err = s.config.TargetDialer()
 	} else {
-		targetConn, err = net.DialTimeout("tcp", s.config.ForwardAddr, 10*time.Second)
+		targetConn, err = net.DialTimeout("tcp", s.config.ForwardAddr, 5*time.Second)
 	}
 
 	if err != nil {
