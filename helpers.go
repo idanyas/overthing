@@ -58,11 +58,11 @@ func defaultYamuxConfig() *yamux.Config {
 	cfg := yamux.DefaultConfig()
 	cfg.AcceptBacklog = 256
 	cfg.EnableKeepAlive = true
-	cfg.KeepAliveInterval = 30 * time.Second
+	cfg.KeepAliveInterval = 10 * time.Second  // Fast keepalive detection
 	cfg.ConnectionWriteTimeout = 10 * time.Second
 	cfg.MaxStreamWindowSize = 256 * 1024
-	cfg.StreamOpenTimeout = 75 * time.Second
-	cfg.StreamCloseTimeout = 5 * time.Minute
+	cfg.StreamOpenTimeout = 30 * time.Second
+	cfg.StreamCloseTimeout = 60 * time.Second
 	cfg.LogOutput = io.Discard
 	return cfg
 }
@@ -103,7 +103,6 @@ func discoverRelay(ctx context.Context, logger func(level, msg string), ignore m
 	}
 
 	if logger != nil {
-		// CLEANUP: Show only Host:Port and Latency
 		addr := net.JoinHostPort(selected.Host, selected.Port)
 		logger("ok", fmt.Sprintf("Selected relay: %s (%.1fms)", addr, selected.LatencyMS()))
 	}

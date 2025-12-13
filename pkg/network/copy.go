@@ -6,6 +6,7 @@ import (
 	"sync"
 )
 
+// Buffer size - 32KB is good balance for throughput vs latency
 const copyBufSize = 32 * 1024
 
 var bufPool = sync.Pool{
@@ -36,11 +37,6 @@ func CopyBidirectional(conn1, conn2 net.Conn) {
 		if cw, ok := dst.(closeWriter); ok {
 			cw.CloseWrite()
 		}
-		// NOTE: We do NOT fallback to Close() here. 
-		// If the connection doesn't support CloseWrite (like Yamux), 
-		// calling Close() would tear down the whole stream, causing data loss 
-		// on the other direction. We rely on the caller to close the connections
-		// when CopyBidirectional returns.
 	}
 
 	go copy(conn1, conn2)

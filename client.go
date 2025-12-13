@@ -25,10 +25,9 @@ type Client struct {
 	tlsConfig   *tls.Config
 	targetBytes []byte
 	
-	// State for relay connection
 	relayAddr    string
 	relayID      string
-	isFixedRelay bool // true if provided by user config, false if dynamic (hint/discovery)
+	isFixedRelay bool
 
 	mu       sync.Mutex
 	running  bool
@@ -44,7 +43,6 @@ type Client struct {
 func NewClient(config ClientConfig) (*Client, error) {
 	config.setDefaults()
 
-	// Check for Relay Hint in the Device ID
 	cleanID, hintIP, hintPort, hasHint := security.SplitRelayHint(config.TargetID)
 	config.TargetID = cleanID
 	
@@ -61,8 +59,6 @@ func NewClient(config ClientConfig) (*Client, error) {
 			config.Logger("info", fmt.Sprintf("Using configured relay: %s", config.RelayURI))
 		}
 	} else if hasHint {
-		// Populate RelayURI from hint
-		// Hint IP might be IPv6
 		config.RelayURI = fmt.Sprintf("relay://%s", net.JoinHostPort(hintIP.String(), fmt.Sprintf("%d", hintPort)))
 		if config.Logger != nil {
 			config.Logger("ok", fmt.Sprintf("Extracted relay hint: %s", config.RelayURI))
@@ -73,7 +69,6 @@ func NewClient(config ClientConfig) (*Client, error) {
 		}
 	}
 
-	// Parse the URI if we have one now
 	var relayAddr, relayID string
 	if config.RelayURI != "" {
 		relayAddr, relayID, err = parseRelayURI(config.RelayURI)
@@ -209,8 +204,8 @@ func (c *Client) handleConnection(ctx context.Context, localConn net.Conn) {
 
 	stream, err := session.Open()
 	if err != nil {
+		c.log("warn", fmt.Sprintf("Stream open failed: %v - invalidating session", err))
 		c.invalidateSession(session)
-		c.log("error", fmt.Sprintf("Stream failed: %v", err))
 		return
 	}
 	defer stream.Close()
@@ -222,11 +217,27 @@ func (c *Client) getSession(ctx context.Context) (*yamux.Session, error) {
 	c.muxMu.Lock()
 	defer c.muxMu.Unlock()
 
+	// Check if existing session is healthy
 	if c.session != nil && !c.session.IsClosed() {
-		return c.session, nil
+		// Quick health check - try a ping with timeout
+		pingDone := make(chan error, 1)
+		go func() {
+			_, err := c.session.Ping()
+			pingDone <- err
+		}()
+		
+		select {
+		case err := <-pingDone:
+			if err == nil {
+				return c.session, nil
+			}
+			c.log("warn", fmt.Sprintf("Session ping failed: %v - reconnecting", err))
+		case <-time.After(2 * time.Second):
+			c.log("warn", "Session ping timeout - reconnecting")
+		}
 	}
 
-	// Clean up old session if existing
+	// Clean up old session
 	if c.session != nil {
 		c.session.Close()
 		c.session = nil
@@ -241,6 +252,13 @@ func (c *Client) getSession(ctx context.Context) (*yamux.Session, error) {
 	}
 
 	for {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		default:
+		}
+
+		// If no relay configured, scan to find one (lightweight probe)
 		if c.config.RelayURI == "" {
 			if c.isFixedRelay {
 				return nil, errors.New("relay URI missing in fixed configuration")
@@ -250,180 +268,35 @@ func (c *Client) getSession(ctx context.Context) (*yamux.Session, error) {
 			uri, err := c.scanRelays(ctx)
 			if err != nil {
 				c.lastError = time.Now()
-				time.Sleep(2 * time.Second)
 				return nil, fmt.Errorf("discovery failed: %w", err)
 			}
 			
 			c.config.RelayURI = uri
-			c.relayAddr, c.relayID, err = parseRelayURI(uri)
-			if err != nil {
-				c.config.RelayURI = "" 
-				return nil, fmt.Errorf("resolved invalid URI: %w", err)
-			}
+			c.relayAddr, c.relayID, _ = parseRelayURI(uri)
 		}
 
-		relayConn, err := c.connectToRelay(ctx)
+		// Now connect to the known relay and establish session
+		tunnelConn, err := c.connectAndEstablishSession(ctx)
 		if err != nil {
-			c.log("warn", fmt.Sprintf("Relay connection failed: %v", err))
+			c.log("warn", fmt.Sprintf("Connection failed: %v", err))
 			
 			if !c.isFixedRelay {
-				c.log("info", "Relay unreachable. Clearing cached relay to re-scan...")
+				c.log("info", "Clearing cached relay to re-scan...")
 				c.config.RelayURI = ""
+				c.relayAddr = ""
+				c.relayID = ""
 				continue
 			}
 			c.lastError = time.Now()
 			return nil, err
 		}
 
-		if err := protocol.WriteMessage(relayConn, protocol.MsgConnectRequest, protocol.XDRBytes(c.targetBytes)); err != nil {
-			relayConn.Close()
-			c.lastError = time.Now()
-			
-			if !c.isFixedRelay {
-				c.config.RelayURI = ""
-				continue
-			}
-			return nil, err
-		}
-
-		var tunnelConn net.Conn
-		
-		for tunnelConn == nil {
-			relayConn.SetReadDeadline(time.Now().Add(60 * time.Second))
-			msgType, body, err := protocol.ReadMessage(relayConn)
-			if err != nil {
-				relayConn.Close()
-				c.lastError = time.Now()
-				if !c.isFixedRelay {
-					c.config.RelayURI = ""
-					break
-				}
-				return nil, err
-			}
-
-			if msgType == protocol.MsgResponse {
-				if len(body) >= 4 {
-					code := int32(binary.BigEndian.Uint32(body[:4]))
-					
-					if code != 0 {
-						relayConn.Close()
-						c.lastError = time.Now()
-						
-						if code == 1 { 
-							c.log("warn", "Target device not found on this relay. Hint might be stale.")
-							
-							if !c.isFixedRelay {
-								c.log("info", "Device likely moved. Re-scanning network...")
-								c.config.RelayURI = ""
-							}
-						}
-						break 
-					}
-				}
-				tunnelConn = relayConn
-				tunnelConn.SetReadDeadline(time.Time{})
-
-			} else if msgType == protocol.MsgSessionInvitation {
-				inv, err := protocol.DecodeInvitation(body)
-				if err != nil {
-					c.log("warn", fmt.Sprintf("Invalid invitation received: %v", err))
-					continue
-				}
-				
-				if len(inv.From) != len(c.targetBytes) {
-					c.log("warn", "Received invitation from unknown device. Ignoring.")
-					continue
-				}
-				
-				match := true
-				for i := range inv.From {
-					if inv.From[i] != c.targetBytes[i] {
-						match = false
-						break
-					}
-				}
-				if !match {
-					c.log("warn", "Received invitation from wrong device ID. Ignoring.")
-					continue
-				}
-
-				relayConn.Close()
-
-				var sessionAddr string
-				if len(inv.Address) > 0 && !net.IP(inv.Address).IsUnspecified() {
-					sessionAddr = net.JoinHostPort(net.IP(inv.Address).String(), fmt.Sprintf("%d", inv.Port))
-				} else {
-					host, _, _ := net.SplitHostPort(c.relayAddr)
-					sessionAddr = net.JoinHostPort(host, fmt.Sprintf("%d", inv.Port))
-				}
-
-				sConn, err := net.DialTimeout("tcp", sessionAddr, 10*time.Second)
-				if err != nil {
-					c.lastError = time.Now()
-					if !c.isFixedRelay {
-						c.config.RelayURI = "" 
-						break
-					}
-					return nil, fmt.Errorf("session dial failed: %w", err)
-				}
-				network.OptimizeConn(sConn)
-
-				if err := protocol.WriteMessage(sConn, protocol.MsgJoinSessionRequest, protocol.XDRBytes(inv.Key)); err != nil {
-					sConn.Close()
-					c.lastError = time.Now()
-					return nil, fmt.Errorf("session join failed: %w", err)
-				}
-
-				sConn.SetReadDeadline(time.Now().Add(10 * time.Second))
-				mType, mBody, err := protocol.ReadMessage(sConn)
-				sConn.SetReadDeadline(time.Time{})
-
-				if err != nil {
-					sConn.Close()
-					c.lastError = time.Now()
-					return nil, fmt.Errorf("session response failed: %w", err)
-				}
-
-				if mType != protocol.MsgResponse {
-					sConn.Close()
-					c.lastError = time.Now()
-					return nil, fmt.Errorf("unexpected response: %d", mType)
-				}
-
-				if len(mBody) >= 4 {
-					if code := int32(binary.BigEndian.Uint32(mBody[:4])); code != 0 {
-						sConn.Close()
-						c.lastError = time.Now()
-						if !c.isFixedRelay {
-							c.config.RelayURI = ""
-							break
-						}
-						return nil, fmt.Errorf("session rejected: code %d", code)
-					}
-				}
-				tunnelConn = sConn
-
-			} else {
-				if msgType == protocol.MsgPing {
-					protocol.WriteMessage(relayConn, protocol.MsgPong, nil)
-					continue
-				}
-				
-				relayConn.Close()
-				c.lastError = time.Now()
-				return nil, fmt.Errorf("unexpected message: %d", msgType)
-			}
-		}
-
-		if tunnelConn == nil {
-			continue
-		}
-
+		// BEP TLS handshake over the tunnel connection
 		bepConfig := &tls.Config{
 			Certificates:       []tls.Certificate{c.config.Identity.Certificate},
 			NextProtos:         []string{"bep/1.0"},
 			MinVersion:         tls.VersionTLS13,
-			InsecureSkipVerify: true, 
+			InsecureSkipVerify: true,
 			VerifyPeerCertificate: func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
 				if len(rawCerts) == 0 {
 					return errors.New("no peer certificate")
@@ -447,6 +320,11 @@ func (c *Client) getSession(ctx context.Context) (*yamux.Session, error) {
 		if err := bepConn.Handshake(); err != nil {
 			tunnelConn.Close()
 			c.lastError = time.Now()
+			
+			if !c.isFixedRelay {
+				c.config.RelayURI = ""
+				continue
+			}
 			return nil, fmt.Errorf("BEP handshake failed: %w", err)
 		}
 		bepConn.SetDeadline(time.Time{})
@@ -470,6 +348,7 @@ func (c *Client) getSession(ctx context.Context) (*yamux.Session, error) {
 	}
 }
 
+// scanRelays does a lightweight probe to find which relay has the target
 func (c *Client) scanRelays(ctx context.Context) (string, error) {
 	c.log("info", "Fetching public relay list...")
 	relays, err := relay.Discover(ctx)
@@ -485,10 +364,10 @@ func (c *Client) scanRelays(ctx context.Context) (string, error) {
 	}
 
 	results := make(chan result, 1)
-	scanCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
+	scanCtx, scanCancel := context.WithCancel(ctx)
+	defer scanCancel()
 
-	workers := 500
+	workers := 300
 	if len(relays) < workers {
 		workers = len(relays)
 	}
@@ -515,7 +394,7 @@ func (c *Client) scanRelays(ctx context.Context) (string, error) {
 				if c.probeRelay(scanCtx, r) {
 					select {
 					case results <- result{uri: r.URL}:
-						cancel()
+						scanCancel()
 					default:
 					}
 					return
@@ -538,7 +417,6 @@ func (c *Client) scanRelays(ctx context.Context) (string, error) {
 			return "", res.err
 		}
 		
-		// CLEANUP: Log only Host:Port for found device
 		u, _ := url.Parse(res.uri)
 		c.log("ok", fmt.Sprintf("Found device on relay: %s", u.Host))
 		
@@ -548,9 +426,10 @@ func (c *Client) scanRelays(ctx context.Context) (string, error) {
 	}
 }
 
+// probeRelay checks if target device is on this relay WITHOUT establishing a session
 func (c *Client) probeRelay(ctx context.Context, r relay.Relay) bool {
-	ctx, cancel := context.WithTimeout(ctx, 3000*time.Millisecond)
-	defer cancel()
+	probeCtx, probeCancel := context.WithTimeout(ctx, 2500*time.Millisecond)
+	defer probeCancel()
 
 	host, _, err := net.SplitHostPort(r.Host)
 	if err != nil {
@@ -559,16 +438,14 @@ func (c *Client) probeRelay(ctx context.Context, r relay.Relay) bool {
 	
 	addr := net.JoinHostPort(r.Host, r.Port)
 	dialer := &net.Dialer{}
-	conn, err := dialer.DialContext(ctx, "tcp", addr)
+	conn, err := dialer.DialContext(probeCtx, "tcp", addr)
 	if err != nil {
 		return false
 	}
 	defer conn.Close()
 
-	if deadline, ok := ctx.Deadline(); ok {
+	if deadline, ok := probeCtx.Deadline(); ok {
 		conn.SetDeadline(deadline)
-	} else {
-		conn.SetDeadline(time.Now().Add(3000 * time.Millisecond))
 	}
 
 	tlsConfig := c.tlsConfig.Clone()
@@ -579,12 +456,12 @@ func (c *Client) probeRelay(ctx context.Context, r relay.Relay) bool {
 		return false
 	}
 
-	// Step 1: Join (empty)
+	// Join relay
 	if err := protocol.WriteMessage(tlsConn, protocol.MsgJoinRelayRequest, []byte{0, 0, 0, 0}); err != nil {
 		return false
 	}
 	
-	// Read Join Response (Loop in case of Ping)
+	// Read Join Response
 	for {
 		msgType, body, err := protocol.ReadMessage(tlsConn)
 		if err != nil {
@@ -598,17 +475,17 @@ func (c *Client) probeRelay(ctx context.Context, r relay.Relay) bool {
 			if len(body) >= 4 && int32(binary.BigEndian.Uint32(body[:4])) != 0 {
 				return false
 			}
-			break // Join Success
+			break
 		}
 		return false
 	}
 
-	// Step 2: Connect Request
+	// Send Connect Request
 	if err := protocol.WriteMessage(tlsConn, protocol.MsgConnectRequest, protocol.XDRBytes(c.targetBytes)); err != nil {
 		return false
 	}
 
-	// Step 3: Wait for Invitation or Failure (Loop for Pings)
+	// Wait for invitation or rejection - this is just a probe, we don't accept
 	for {
 		msgType, body, err := protocol.ReadMessage(tlsConn)
 		if err != nil {
@@ -621,19 +498,125 @@ func (c *Client) probeRelay(ctx context.Context, r relay.Relay) bool {
 		}
 
 		if msgType == protocol.MsgSessionInvitation {
+			// Device found! Close connection, we'll connect properly later
 			return true
 		}
 
 		if msgType == protocol.MsgResponse {
-			if len(body) >= 4 {
-				code := int32(binary.BigEndian.Uint32(body[:4]))
-				if code == 0 {
-					return true // Rare but possible success code?
-				}
+			if len(body) >= 4 && int32(binary.BigEndian.Uint32(body[:4])) == 0 {
+				return true
 			}
-			return false // Explicit rejection (not found)
+			return false
 		}
 		return false
+	}
+}
+
+// connectAndEstablishSession connects to known relay and establishes session
+func (c *Client) connectAndEstablishSession(ctx context.Context) (net.Conn, error) {
+	relayConn, err := c.connectToRelay(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := protocol.WriteMessage(relayConn, protocol.MsgConnectRequest, protocol.XDRBytes(c.targetBytes)); err != nil {
+		relayConn.Close()
+		return nil, err
+	}
+
+	for {
+		relayConn.SetReadDeadline(time.Now().Add(60 * time.Second))
+		msgType, body, err := protocol.ReadMessage(relayConn)
+		if err != nil {
+			relayConn.Close()
+			return nil, err
+		}
+
+		if msgType == protocol.MsgPing {
+			protocol.WriteMessage(relayConn, protocol.MsgPong, nil)
+			continue
+		}
+
+		if msgType == protocol.MsgResponse {
+			relayConn.Close()
+			if len(body) >= 4 {
+				code := int32(binary.BigEndian.Uint32(body[:4]))
+				if code != 0 {
+					return nil, fmt.Errorf("connect rejected: code %d", code)
+				}
+			}
+			return nil, errors.New("unexpected response")
+		}
+
+		if msgType == protocol.MsgSessionInvitation {
+			inv, err := protocol.DecodeInvitation(body)
+			if err != nil {
+				relayConn.Close()
+				return nil, err
+			}
+			
+			// Verify invitation
+			if len(inv.From) != len(c.targetBytes) {
+				continue
+			}
+			match := true
+			for i := range inv.From {
+				if inv.From[i] != c.targetBytes[i] {
+					match = false
+					break
+				}
+			}
+			if !match {
+				continue
+			}
+
+			relayConn.Close()
+
+			var sessionAddr string
+			if len(inv.Address) > 0 && !net.IP(inv.Address).IsUnspecified() {
+				sessionAddr = net.JoinHostPort(net.IP(inv.Address).String(), fmt.Sprintf("%d", inv.Port))
+			} else {
+				host, _, _ := net.SplitHostPort(c.relayAddr)
+				sessionAddr = net.JoinHostPort(host, fmt.Sprintf("%d", inv.Port))
+			}
+
+			sConn, err := net.DialTimeout("tcp", sessionAddr, 10*time.Second)
+			if err != nil {
+				return nil, fmt.Errorf("session dial failed: %w", err)
+			}
+			network.OptimizeConn(sConn)
+
+			if err := protocol.WriteMessage(sConn, protocol.MsgJoinSessionRequest, protocol.XDRBytes(inv.Key)); err != nil {
+				sConn.Close()
+				return nil, fmt.Errorf("session join failed: %w", err)
+			}
+
+			sConn.SetReadDeadline(time.Now().Add(10 * time.Second))
+			mType, mBody, err := protocol.ReadMessage(sConn)
+			sConn.SetReadDeadline(time.Time{})
+
+			if err != nil {
+				sConn.Close()
+				return nil, fmt.Errorf("session response failed: %w", err)
+			}
+
+			if mType != protocol.MsgResponse {
+				sConn.Close()
+				return nil, fmt.Errorf("unexpected response: %d", mType)
+			}
+
+			if len(mBody) >= 4 {
+				if code := int32(binary.BigEndian.Uint32(mBody[:4])); code != 0 {
+					sConn.Close()
+					return nil, fmt.Errorf("session rejected: code %d", code)
+				}
+			}
+			
+			return sConn, nil
+		}
+
+		relayConn.Close()
+		return nil, fmt.Errorf("unexpected message: %d", msgType)
 	}
 }
 
@@ -709,6 +692,7 @@ func (c *Client) invalidateSession(session *yamux.Session) {
 			c.bepConn = nil
 		}
 		c.lastError = time.Now()
+		c.log("info", "Session invalidated, will reconnect on next request")
 		if c.config.OnTunnelLost != nil {
 			c.config.OnTunnelLost(errors.New("session invalidated"))
 		}

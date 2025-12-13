@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/hashicorp/yamux"
@@ -32,7 +33,8 @@ type Server struct {
 	running bool
 	cancel  context.CancelFunc
 	
-	streamSem chan struct{}
+	streamSem    chan struct{}
+	activeConns  int64
 }
 
 func NewServer(config ServerConfig) (*Server, error) {
@@ -153,7 +155,6 @@ func (s *Server) runSession(ctx context.Context) error {
 	s.log("ok", "Joined relay")
 
 	if s.config.OnRelayJoined != nil {
-		// Pass both the Persistent ID (s.DeviceID()) and the Hinted ID
 		s.config.OnRelayJoined(s.relayAddr, s.DeviceID(), idWithHint)
 	}
 
@@ -285,31 +286,43 @@ func (s *Server) connectToRelay(ctx context.Context) (*tls.Conn, error) {
 }
 
 func (s *Server) handleTunnel(ctx context.Context, inv protocol.Invitation) {
-	bepConn, err := s.establishTunnel(inv)
+	clientID := formatDeviceIDShort(inv.From)
+	
+	// Use shorter timeout for tunnel establishment
+	establishCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	bepConn, err := s.establishTunnel(establishCtx, inv)
+	cancel()
+	
 	if err != nil {
-		s.log("error", fmt.Sprintf("Tunnel setup failed: %v", err))
+		s.log("error", fmt.Sprintf("Tunnel setup failed for %s: %v", clientID, err))
 		return
 	}
 
+	// Create done channel for cleanup
+	tunnelDone := make(chan struct{})
 	go func() {
-		<-ctx.Done()
+		select {
+		case <-ctx.Done():
+			bepConn.Close()
+		case <-tunnelDone:
+		}
+	}()
+	defer func() {
+		close(tunnelDone)
 		bepConn.Close()
 	}()
-	defer bepConn.Close()
 
 	muxSession, err := yamux.Server(bepConn, defaultYamuxConfig())
 	if err != nil {
-		s.log("error", fmt.Sprintf("Mux setup failed: %v", err))
+		s.log("error", fmt.Sprintf("Mux setup failed for %s: %v", clientID, err))
 		return
 	}
 	defer muxSession.Close()
 
 	peerCerts := bepConn.ConnectionState().PeerCertificates
-	if len(peerCerts) == 0 {
-		s.log("error", "No peer certs in established tunnel")
-		return
+	if len(peerCerts) > 0 {
+		clientID = formatDeviceIDShort(security.GetDeviceIDBytes(peerCerts[0].Raw))
 	}
-	clientID := formatDeviceIDShort(security.GetDeviceIDBytes(peerCerts[0].Raw))
 
 	s.log("ok", fmt.Sprintf("Tunnel ready from %s (multiplexed)", clientID))
 
@@ -318,11 +331,13 @@ func (s *Server) handleTunnel(ctx context.Context, inv protocol.Invitation) {
 	}
 
 	defer func() {
+		s.log("info", fmt.Sprintf("Tunnel closed for %s", clientID))
 		if s.config.OnDisconnect != nil {
 			s.config.OnDisconnect(clientID)
 		}
 	}()
 
+	// Stream accept loop
 	for {
 		if ctx.Err() != nil {
 			return
@@ -330,26 +345,34 @@ func (s *Server) handleTunnel(ctx context.Context, inv protocol.Invitation) {
 
 		stream, err := muxSession.Accept()
 		if err != nil {
-			if err != io.EOF && !strings.Contains(err.Error(), "closed") {
-				s.log("error", fmt.Sprintf("Stream accept error: %v", err))
+			if err == io.EOF {
+				s.log("info", fmt.Sprintf("Client %s disconnected cleanly", clientID))
+			} else if !strings.Contains(err.Error(), "closed") {
+				s.log("warn", fmt.Sprintf("Stream accept error for %s: %v", clientID, err))
 			}
-			break
+			return
 		}
+		
+		atomic.AddInt64(&s.activeConns, 1)
 		
 		select {
 		case s.streamSem <- struct{}{}:
-			go func() {
-				defer func() { <-s.streamSem }()
-				s.handleStream(stream)
-			}()
+			go func(stream net.Conn) {
+				defer func() { 
+					<-s.streamSem 
+					atomic.AddInt64(&s.activeConns, -1)
+				}()
+				s.handleStream(stream, clientID)
+			}(stream)
 		case <-ctx.Done():
 			stream.Close()
+			atomic.AddInt64(&s.activeConns, -1)
 			return
 		}
 	}
 }
 
-func (s *Server) establishTunnel(inv protocol.Invitation) (*tls.Conn, error) {
+func (s *Server) establishTunnel(ctx context.Context, inv protocol.Invitation) (*tls.Conn, error) {
 	u, _ := url.Parse(s.config.RelayURI)
 
 	var tunnelAddr string
@@ -365,22 +388,26 @@ func (s *Server) establishTunnel(inv protocol.Invitation) (*tls.Conn, error) {
 		tunnelAddr = net.JoinHostPort(host, fmt.Sprintf("%d", inv.Port))
 	}
 
-	sessConn, err := net.DialTimeout("tcp", tunnelAddr, 10*time.Second)
+	dialer := &net.Dialer{}
+	sessConn, err := dialer.DialContext(ctx, "tcp", tunnelAddr)
 	if err != nil {
 		return nil, fmt.Errorf("session dial failed: %w", err)
 	}
 
 	network.OptimizeConn(sessConn)
 
+	// Use context deadline for all operations
+	deadline, ok := ctx.Deadline()
+	if ok {
+		sessConn.SetDeadline(deadline)
+	}
+
 	if err := protocol.WriteMessage(sessConn, protocol.MsgJoinSessionRequest, protocol.XDRBytes(inv.Key)); err != nil {
 		sessConn.Close()
 		return nil, fmt.Errorf("session join failed: %w", err)
 	}
 
-	sessConn.SetReadDeadline(time.Now().Add(15 * time.Second))
 	msgType, body, err := protocol.ReadMessage(sessConn)
-	sessConn.SetReadDeadline(time.Time{})
-
 	if err != nil {
 		sessConn.Close()
 		return nil, fmt.Errorf("session response failed: %w", err)
@@ -428,17 +455,18 @@ func (s *Server) establishTunnel(inv protocol.Invitation) (*tls.Conn, error) {
 
 	bepConn := tls.Server(sessConn, bepConfig)
 
-	bepConn.SetDeadline(time.Now().Add(15 * time.Second))
 	if err := bepConn.Handshake(); err != nil {
 		sessConn.Close()
 		return nil, fmt.Errorf("TLS handshake failed: %w", err)
 	}
-	bepConn.SetDeadline(time.Time{})
+	
+	// Clear deadline after successful handshake
+	sessConn.SetDeadline(time.Time{})
 
 	return bepConn, nil
 }
 
-func (s *Server) handleStream(stream net.Conn) {
+func (s *Server) handleStream(stream net.Conn, clientID string) {
 	defer stream.Close()
 
 	var targetConn net.Conn
@@ -451,7 +479,7 @@ func (s *Server) handleStream(stream net.Conn) {
 	}
 
 	if err != nil {
-		s.log("error", fmt.Sprintf("Failed to dial target: %v", err))
+		s.log("error", fmt.Sprintf("Failed to dial target for %s: %v", clientID, err))
 		return
 	}
 	defer targetConn.Close()
