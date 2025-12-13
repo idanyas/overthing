@@ -57,12 +57,11 @@ func formatDeviceIDShort(raw []byte) string {
 func defaultYamuxConfig() *yamux.Config {
 	cfg := yamux.DefaultConfig()
 	cfg.AcceptBacklog = 256
-	// KeepAlive Disabled for pure silence on the wire when idle
 	cfg.EnableKeepAlive = false 
-	cfg.KeepAliveInterval = 30 * time.Second
+	cfg.KeepAliveInterval = 15 * time.Second
 	cfg.ConnectionWriteTimeout = 10 * time.Second
-	// 256KB Window: standard
-	cfg.MaxStreamWindowSize = 256 * 1024
+	// 4MB Window: Prevents throughput collapse on high-latency links.
+	cfg.MaxStreamWindowSize = 4 * 1024 * 1024
 	cfg.StreamOpenTimeout = 15 * time.Second
 	cfg.StreamCloseTimeout = 30 * time.Second
 	cfg.LogOutput = io.Discard

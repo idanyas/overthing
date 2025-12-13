@@ -7,9 +7,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
-	"io"
 	"net"
-	"net/url"
 	"strconv"
 	"strings"
 	"sync"
@@ -26,7 +24,7 @@ import (
 type Server struct {
 	config    ServerConfig
 	tlsConfig *tls.Config
-	relayAddr string
+	relayAddr string // Pre-resolved IP:Port
 	relayID   string
 
 	mu      sync.Mutex
@@ -81,6 +79,7 @@ func (s *Server) Run(ctx context.Context) error {
 		s.config.RelayURI = uri
 	}
 
+	// Resolve the relay address once at startup to avoid DNS in the hot path
 	relayAddr, relayID, err := parseRelayURI(s.config.RelayURI)
 	if err != nil {
 		return fmt.Errorf("invalid relay URI: %w", err)
@@ -202,26 +201,21 @@ func (s *Server) generateDeviceIDWithHint(conn net.Conn) string {
 
 	host, portStr, err := net.SplitHostPort(targetAddr)
 	if err != nil {
-		s.log("warn", fmt.Sprintf("Cannot parse relay address %q: %v", targetAddr, err))
 		return s.DeviceID()
 	}
 
 	port, err := strconv.Atoi(portStr)
 	if err != nil {
-		s.log("warn", fmt.Sprintf("Cannot parse relay port %q: %v", portStr, err))
 		return s.DeviceID()
 	}
 
 	ip := net.ParseIP(host)
 	if ip == nil {
-		s.log("warn", fmt.Sprintf("Cannot parse relay IP %q for hint", host))
 		return s.DeviceID()
 	}
 
 	idWithHint := security.JoinRelayHint(s.DeviceID(), ip, port)
-
 	if len(idWithHint) == len(s.DeviceID()) {
-		s.log("warn", "Failed to embed relay hint in Device ID")
 		return s.DeviceID()
 	}
 
@@ -230,6 +224,7 @@ func (s *Server) generateDeviceIDWithHint(conn net.Conn) string {
 
 func (s *Server) connectToRelay(ctx context.Context) (*tls.Conn, error) {
 	dialer := &net.Dialer{Timeout: 10 * time.Second}
+	// Use pre-resolved s.relayAddr
 	conn, err := dialer.DialContext(ctx, "tcp", s.relayAddr)
 	if err != nil {
 		return nil, fmt.Errorf("dial failed: %w", err)
@@ -288,22 +283,18 @@ func (s *Server) connectToRelay(ctx context.Context) (*tls.Conn, error) {
 func (s *Server) handleTunnel(ctx context.Context, inv protocol.Invitation) {
 	clientID := formatDeviceIDShort(inv.From)
 
-	// Use shorter timeout for tunnel establishment - faster failure for stale invitations
-	establishCtx, cancel := context.WithTimeout(ctx, 8*time.Second)
+	establishCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	bepConn, err := s.establishTunnel(establishCtx, inv)
 	cancel()
 
 	if err != nil {
-		// Don't log timeout errors as ERROR - they're expected for stale invitations
-		if strings.Contains(err.Error(), "timeout") || strings.Contains(err.Error(), "i/o timeout") {
-			s.log("info", fmt.Sprintf("Tunnel setup timed out for %s (likely stale invitation)", clientID))
-		} else {
-			s.log("error", fmt.Sprintf("Tunnel setup failed for %s: %v", clientID, err))
+		// Only log timeout if verbose or it looks like a real error
+		if !strings.Contains(err.Error(), "timeout") {
+			s.log("warn", fmt.Sprintf("Tunnel setup failed for %s: %v", clientID, err))
 		}
 		return
 	}
 
-	// Create done channel for cleanup
 	tunnelDone := make(chan struct{})
 	go func() {
 		select {
@@ -324,8 +315,7 @@ func (s *Server) handleTunnel(ctx context.Context, inv protocol.Invitation) {
 	}
 	defer muxSession.Close()
 
-	peerCerts := bepConn.ConnectionState().PeerCertificates
-	if len(peerCerts) > 0 {
+	if peerCerts := bepConn.ConnectionState().PeerCertificates; len(peerCerts) > 0 {
 		clientID = formatDeviceIDShort(security.GetDeviceIDBytes(peerCerts[0].Raw))
 	}
 
@@ -342,7 +332,6 @@ func (s *Server) handleTunnel(ctx context.Context, inv protocol.Invitation) {
 		}
 	}()
 
-	// Stream accept loop
 	for {
 		if ctx.Err() != nil {
 			return
@@ -350,11 +339,6 @@ func (s *Server) handleTunnel(ctx context.Context, inv protocol.Invitation) {
 
 		stream, err := muxSession.Accept()
 		if err != nil {
-			if err == io.EOF {
-				s.log("info", fmt.Sprintf("Client %s disconnected cleanly", clientID))
-			} else if !strings.Contains(err.Error(), "closed") {
-				s.log("warn", fmt.Sprintf("Stream accept error for %s: %v", clientID, err))
-			}
 			return
 		}
 
@@ -378,18 +362,17 @@ func (s *Server) handleTunnel(ctx context.Context, inv protocol.Invitation) {
 }
 
 func (s *Server) establishTunnel(ctx context.Context, inv protocol.Invitation) (*tls.Conn, error) {
-	u, _ := url.Parse(s.config.RelayURI)
-
 	var tunnelAddr string
 	tunnelIP := net.IP(inv.Address)
 
+	// Optimization: If the invitation address is missing or unspecified,
+	// use the cached, pre-resolved relay IP from startup.
+	// This avoids DNS lookups in the hot path of tunnel establishment.
 	if len(tunnelIP) > 0 && !tunnelIP.IsUnspecified() {
 		tunnelAddr = net.JoinHostPort(tunnelIP.String(), fmt.Sprintf("%d", inv.Port))
 	} else {
-		host, _, err := net.SplitHostPort(u.Host)
-		if err != nil {
-			host = u.Host
-		}
+		// Use s.relayAddr which is already "IP:Port"
+		host, _, _ := net.SplitHostPort(s.relayAddr)
 		tunnelAddr = net.JoinHostPort(host, fmt.Sprintf("%d", inv.Port))
 	}
 
@@ -401,9 +384,7 @@ func (s *Server) establishTunnel(ctx context.Context, inv protocol.Invitation) (
 
 	network.OptimizeConn(sessConn)
 
-	// Use context deadline for all operations
-	deadline, ok := ctx.Deadline()
-	if ok {
+	if deadline, ok := ctx.Deadline(); ok {
 		sessConn.SetDeadline(deadline)
 	}
 
@@ -420,7 +401,7 @@ func (s *Server) establishTunnel(ctx context.Context, inv protocol.Invitation) (
 
 	if msgType != protocol.MsgResponse {
 		sessConn.Close()
-		return nil, errors.New("session rejected: wrong message type")
+		return nil, errors.New("session rejected")
 	}
 
 	if len(body) >= 4 {
@@ -440,20 +421,16 @@ func (s *Server) establishTunnel(ctx context.Context, inv protocol.Invitation) (
 			if len(s.config.AllowedClientIDs) == 0 || s.config.AllowAnyClient {
 				return nil
 			}
-
 			if len(rawCerts) == 0 {
-				return errors.New("client did not present a certificate")
+				return errors.New("no client cert")
 			}
-
 			clientID := security.GetDeviceID(rawCerts[0])
 			compactID := security.GetDeviceIDCompact(rawCerts[0])
-
 			for _, allowedID := range s.config.AllowedClientIDs {
 				if allowedID == clientID || allowedID == compactID {
 					return nil
 				}
 			}
-
 			return fmt.Errorf("client %s not authorized", compactID)
 		},
 	}
@@ -465,9 +442,7 @@ func (s *Server) establishTunnel(ctx context.Context, inv protocol.Invitation) (
 		return nil, fmt.Errorf("TLS handshake failed: %w", err)
 	}
 
-	// Clear deadline after successful handshake
 	sessConn.SetDeadline(time.Time{})
-
 	return bepConn, nil
 }
 
@@ -484,7 +459,6 @@ func (s *Server) handleStream(stream net.Conn, clientID string) {
 	}
 
 	if err != nil {
-		s.log("error", fmt.Sprintf("Failed to dial target for %s: %v", clientID, err))
 		return
 	}
 	defer targetConn.Close()

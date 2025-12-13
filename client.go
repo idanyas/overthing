@@ -225,9 +225,6 @@ func (c *Client) getSessionWithGen(ctx context.Context) (*yamux.Session, uint64,
 	session := c.session
 	gen := c.sessionGen
 	
-	// OPTIMIZATION: We do NOT ping here. Assume session is healthy.
-	// If it's dead, session.Open() will fail, and we will retry in handleConnection.
-	// This saves 1 RTT per connection.
 	if session != nil && !session.IsClosed() {
 		c.muxMu.RUnlock()
 		return session, gen, nil
@@ -368,7 +365,9 @@ func (c *Client) scanAndConnect(ctx context.Context) (net.Conn, string, error) {
 
 	var found int32
 
-	workers := 300
+	// Reduce worker count to avoid network saturation and FD limits.
+	// 300 was too high causing connection timeouts.
+	workers := 100
 	if len(relays) < workers {
 		workers = len(relays)
 	}
@@ -438,7 +437,9 @@ func (c *Client) scanAndConnect(ctx context.Context) (net.Conn, string, error) {
 
 // tryRelayAndConnect connects to a relay, requests connection to target, and returns the tunnel
 func (c *Client) tryRelayAndConnect(ctx context.Context, r relay.Relay) (net.Conn, error) {
-	probeCtx, probeCancel := context.WithTimeout(ctx, 5*time.Second)
+	// Increased timeout to 15s to allow for full relay session establishment.
+	// Previous 5s was too short for the Server to receive invitation and dial back.
+	probeCtx, probeCancel := context.WithTimeout(ctx, 15*time.Second)
 	defer probeCancel()
 
 	host, _, err := net.SplitHostPort(r.Host)
