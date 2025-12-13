@@ -139,3 +139,63 @@ When a server joins a relay, it learns the relay's IP address and port. This inf
 ```
 
 This allows clients to connect directly without any discovery overhead. If the relay changes or becomes unavailable, the client seamlessly falls back to global discovery.
+
+## Examples
+
+The `examples/` directory contains comprehensive examples demonstrating various use cases:
+
+### Basic Examples
+
+```bash
+# Server with verbose output
+go run examples/server/main.go -v -stats
+
+# Client with statistics
+go run examples/client/main.go -v -stats <device-id>
+
+# One-shot dial
+go run examples/dial/main.go <device-id>
+```
+
+### Advanced Examples
+
+```bash
+# Unix socket forwarding
+go run examples/unix-socket/main.go -mode echo &    # Start echo on socket
+go run examples/unix-socket/main.go -mode server    # Start tunnel server
+
+# In-memory testing (no network required)
+go run examples/memory-pipe/main.go
+
+# Echo server for testing
+go run examples/echo-server/main.go -addr 127.0.0.1:9999
+
+# All-in-one bidirectional test
+go run examples/bidirectional/main.go
+
+# Show all configuration options
+go run examples/advanced/main.go -show-config
+```
+
+### Internal Go Networking
+
+The library supports custom `net.Listener` and `net.Conn` implementations for advanced use cases:
+
+```go
+// Server: Forward to Unix socket instead of TCP
+server := tunnel.NewServer(tunnel.ServerConfig{
+    TargetDialer: func() (net.Conn, error) {
+        return net.Dial("unix", "/var/run/app.sock")
+    },
+})
+
+// Client: Listen on Unix socket instead of TCP
+listener, _ := net.Listen("unix", "/tmp/tunnel.sock")
+client := tunnel.NewClient(tunnel.ClientConfig{
+    Listener: listener,
+})
+
+// Testing: Use in-memory pipes
+serverConn, clientConn := net.Pipe()
+// Use serverConn in TargetDialer, clientConn for testing
+```
