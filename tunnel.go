@@ -26,6 +26,7 @@ package tunnel
 
 import (
 	"crypto/tls"
+	"fmt"
 
 	"github.com/idanyas/overthing/pkg/security"
 )
@@ -54,7 +55,10 @@ type Identity struct {
 // GenerateIdentity creates a new random Ed25519-based identity.
 // The identity is ephemeral and not persisted to disk.
 func GenerateIdentity() Identity {
-	cert, fullID, compactID := security.GenerateIdentity()
+	cert, fullID, compactID, err := security.GenerateIdentity()
+	if err != nil {
+		panic(fmt.Sprintf("tunnel: failed to generate identity: %v", err))
+	}
 	return Identity{
 		Certificate: cert,
 		FullID:      fullID,
@@ -69,7 +73,10 @@ func GenerateIdentity() Identity {
 // The identity file format is a 43-character base64url-encoded Ed25519 seed.
 // Legacy PEM format files are also supported for reading.
 func LoadOrGenerateIdentity(path string) (Identity, error) {
-	cert, fullID, compactID := security.LoadOrGenerateIdentity(path)
+	cert, fullID, compactID, err := security.LoadOrGenerateIdentity(path)
+	if err != nil {
+		return Identity{}, err
+	}
 	return Identity{
 		Certificate: cert,
 		FullID:      fullID,

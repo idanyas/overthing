@@ -15,8 +15,6 @@ import (
 	"os"
 	"strings"
 	"time"
-
-	"github.com/idanyas/overthing/pkg/logging"
 )
 
 // IMPORTANT - COMPACT ID ENCODING - DO NOT MODIFY:
@@ -205,37 +203,33 @@ func decodePackedIPPort(cleanID string, buf []byte) (string, net.IP, int, bool) 
 	return cleanID, nil, 0, false
 }
 
-func LoadOrGenerateIdentity(path string) (tls.Certificate, string, string) {
+func LoadOrGenerateIdentity(path string) (tls.Certificate, string, string, error) {
 	if path == "" {
-		logging.Info("Using ephemeral identity (not saved)")
 		return GenerateIdentity()
 	}
 
-	cert, isCompact, err := LoadIdentity(path)
+	cert, _, err := LoadIdentity(path)
 	if err == nil {
 		fullID := GetDeviceID(cert.Certificate[0])
 		compactID := GetDeviceIDCompact(cert.Certificate[0])
-		if isCompact {
-			logging.Info("Loaded identity from %s", path)
-		} else {
-			logging.Info("Loaded identity from %s (PEM format)", path)
-		}
-		return cert, fullID, compactID
+		return cert, fullID, compactID, nil
 	}
 
 	seed := make([]byte, ed25519.SeedSize)
 	if _, err := rand.Read(seed); err != nil {
-		logging.Fatal("Failed to generate random seed: %v", err)
+		return tls.Certificate{}, "", "", fmt.Errorf("failed to generate random seed: %w", err)
 	}
 
-	cert, fullID, compactID := GenerateIdentityFromSeed(seed)
+	cert, fullID, compactID, err := GenerateIdentityFromSeed(seed)
+	if err != nil {
+		return tls.Certificate{}, "", "", err
+	}
+
 	if err := SaveIdentityCompact(path, seed); err != nil {
-		logging.Warn("Failed to save identity to %s: %v", path, err)
-	} else {
-		logging.OK("Generated new identity, saved to %s", path)
+		return tls.Certificate{}, "", "", fmt.Errorf("failed to save identity to %s: %w", path, err)
 	}
 
-	return cert, fullID, compactID
+	return cert, fullID, compactID, nil
 }
 
 func LoadIdentity(path string) (tls.Certificate, bool, error) {
@@ -248,7 +242,10 @@ func LoadIdentity(path string) (tls.Certificate, bool, error) {
 	if len(content) == compactEncodedLen {
 		seed, err := decodeBase63(content)
 		if err == nil && len(seed) == 32 {
-			cert, _, _ := GenerateIdentityFromSeed(seed)
+			cert, _, _, err := GenerateIdentityFromSeed(seed)
+			if err != nil {
+				return tls.Certificate{}, true, err
+			}
 			return cert, true, nil
 		}
 	}
@@ -286,15 +283,15 @@ func SaveIdentityCompact(path string, seed []byte) error {
 	return os.WriteFile(path, []byte(encoded+"\n"), 0600)
 }
 
-func GenerateIdentity() (tls.Certificate, string, string) {
+func GenerateIdentity() (tls.Certificate, string, string, error) {
 	seed := make([]byte, ed25519.SeedSize)
 	if _, err := rand.Read(seed); err != nil {
-		logging.Fatal("Failed to generate random seed: %v", err)
+		return tls.Certificate{}, "", "", fmt.Errorf("failed to generate random seed: %w", err)
 	}
 	return GenerateIdentityFromSeed(seed)
 }
 
-func GenerateIdentityFromSeed(seed []byte) (tls.Certificate, string, string) {
+func GenerateIdentityFromSeed(seed []byte) (tls.Certificate, string, string, error) {
 	privateKey := ed25519.NewKeyFromSeed(seed)
 	publicKey := privateKey.Public().(ed25519.PublicKey)
 
@@ -309,7 +306,7 @@ func GenerateIdentityFromSeed(seed []byte) (tls.Certificate, string, string) {
 
 	certDER, err := x509.CreateCertificate(rand.Reader, &template, &template, publicKey, privateKey)
 	if err != nil {
-		logging.Fatal("Failed to create certificate: %v", err)
+		return tls.Certificate{}, "", "", fmt.Errorf("failed to create certificate: %w", err)
 	}
 
 	cert := tls.Certificate{
@@ -320,7 +317,7 @@ func GenerateIdentityFromSeed(seed []byte) (tls.Certificate, string, string) {
 	fullID := GetDeviceID(certDER)
 	compactID := GetDeviceIDCompact(certDER)
 
-	return cert, fullID, compactID
+	return cert, fullID, compactID, nil
 }
 
 func GetDeviceID(certDER []byte) string {
