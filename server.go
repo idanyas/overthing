@@ -22,6 +22,11 @@ import (
 )
 
 type Server struct {
+	// activeConns is accessed atomically and must be 64-bit aligned.
+	// On 32-bit architectures (like x86/386), we must place this at the
+	// beginning of the struct to ensure the Go allocator aligns it correctly.
+	activeConns int64
+
 	config    ServerConfig
 	tlsConfig *tls.Config
 	relayAddr string // Pre-resolved IP:Port
@@ -32,7 +37,6 @@ type Server struct {
 	cancel  context.CancelFunc
 
 	streamSem   chan struct{}
-	activeConns int64
 }
 
 func NewServer(config ServerConfig) (*Server, error) {
