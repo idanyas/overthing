@@ -34,7 +34,7 @@ func CopyBidirectional(conn1, conn2 net.Conn) {
 			nr, err := src.Read(buf)
 			if nr > 0 {
 				nw, ew := dst.Write(buf[0:nr])
-				if nw < 0 || nr < nw {
+				if nw < 0 || nw < nr {
 					if ew == nil {
 						ew = io.ErrShortWrite
 					}
