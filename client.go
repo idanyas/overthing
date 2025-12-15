@@ -7,6 +7,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"math/rand"
 	"net"
 	"net/url"
 	"sync"
@@ -19,6 +20,14 @@ import (
 	"github.com/idanyas/overthing/pkg/protocol"
 	"github.com/idanyas/overthing/pkg/relay"
 	"github.com/idanyas/overthing/pkg/security"
+)
+
+// Package-level cache
+var (
+	relayCache      []relay.Relay
+	relayCacheTime  time.Time
+	relayCacheMu    sync.RWMutex
+	relayCacheTTL   = 15 * time.Minute
 )
 
 type Client struct {
@@ -137,19 +146,58 @@ func (c *Client) Run(ctx context.Context) error {
 		listener.Close()
 	}()
 
-	// Automatic Connectivity Test
+	// Automatic Connectivity Maintenance in background
 	go func() {
 		c.log("info", "Verifying connectivity to server...")
 
-		testCtx, testCancel := context.WithTimeout(ctx, 30*time.Second)
-		defer testCancel()
+		delay := c.config.ReconnectDelay
+		if delay < 1*time.Second {
+			delay = 1 * time.Second
+		}
 
-		// Force a session establishment
-		if _, err := c.getSession(testCtx); err != nil {
-			c.log("warn", fmt.Sprintf("Initial connection test failed: %v", err))
-			c.log("info", "Client will keep retrying when connections arrive...")
-		} else {
-			c.log("ok", "Connectivity verified. Tunnel is ready.")
+		for {
+			if ctx.Err() != nil {
+				return
+			}
+
+			// We pass the main context here. The establishment logic handles its own timeouts.
+			session, err := c.getSession(ctx)
+
+			if err != nil {
+				c.log("warn", fmt.Sprintf("Connection failed: %v", err))
+				c.log("info", fmt.Sprintf("Retrying in %v...", delay))
+
+				select {
+				case <-ctx.Done():
+					return
+				case <-time.After(delay):
+					// Exponential backoff with cap
+					if delay < 30*time.Second {
+						delay *= 2
+					}
+				}
+				continue
+			}
+
+			// Connected successfully
+			c.log("ok", "Tunnel is ready.")
+			
+			// Reset delay
+			delay = c.config.ReconnectDelay
+			if delay < 1*time.Second {
+				delay = 1 * time.Second
+			}
+
+			// Block until session closes or context cancelled
+			select {
+			case <-session.CloseChan():
+				c.log("warn", "Tunnel connection lost. Reconnecting...")
+			case <-ctx.Done():
+				return
+			}
+			
+			// Brief pause to prevent hot loops
+			time.Sleep(100 * time.Millisecond)
 		}
 	}()
 
@@ -183,34 +231,42 @@ func (c *Client) Stop() {
 func (c *Client) handleConnection(ctx context.Context, localConn net.Conn) {
 	defer localConn.Close()
 
-	// Attempt to open a stream. If the session is dead, we retry once.
-	var stream net.Conn
-	var err error
 	var session *yamux.Session
 	var sessionGen uint64
+	var err error
+	var stream net.Conn
 
-	for retry := 0; retry < 2; retry++ {
-		session, sessionGen, err = c.getSessionWithGen(ctx)
-		if err != nil {
-			c.log("error", fmt.Sprintf("Session failed: %v", err))
+	backoff := 100 * time.Millisecond
+
+	for {
+		if ctx.Err() != nil {
 			return
 		}
 
-		stream, err = session.Open()
+		session, sessionGen, err = c.getSessionWithGen(ctx)
 		if err == nil {
-			break // Success
+			stream, err = session.Open()
+			if err == nil {
+				break // Success
+			}
+			c.invalidateSessionIfMatch(sessionGen)
 		}
 
-		c.log("warn", fmt.Sprintf("Stream open failed (attempt %d): %v - invalidating session", retry+1, err))
-		c.invalidateSessionIfMatch(sessionGen)
+		if backoff > 2*time.Second {
+			c.log("info", fmt.Sprintf("Waiting for tunnel... (%v)", err))
+		}
+		
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(backoff):
+			if backoff < 2*time.Second {
+				backoff *= 2
+			}
+		}
 	}
 
-	if err != nil {
-		c.log("error", fmt.Sprintf("Failed to open stream after retry: %v", err))
-		return
-	}
 	defer stream.Close()
-
 	network.CopyBidirectional(stream, localConn)
 }
 
@@ -220,7 +276,6 @@ func (c *Client) getSession(ctx context.Context) (*yamux.Session, error) {
 }
 
 func (c *Client) getSessionWithGen(ctx context.Context) (*yamux.Session, uint64, error) {
-	// Fast path: check if we have a valid session without full lock
 	c.muxMu.RLock()
 	session := c.session
 	gen := c.sessionGen
@@ -231,16 +286,13 @@ func (c *Client) getSessionWithGen(ctx context.Context) (*yamux.Session, uint64,
 	}
 	c.muxMu.RUnlock()
 
-	// Slow path: need to create new session
 	c.muxMu.Lock()
 	defer c.muxMu.Unlock()
 
-	// Double-check after acquiring write lock
 	if c.session != nil && !c.session.IsClosed() {
 		return c.session, c.sessionGen, nil
 	}
 
-	// Clean up old session
 	if c.session != nil {
 		c.session.Close()
 		c.session = nil
@@ -250,7 +302,6 @@ func (c *Client) getSessionWithGen(ctx context.Context) (*yamux.Session, uint64,
 		c.bepConn = nil
 	}
 
-	// Try to establish session
 	session, bepConn, err := c.establishNewSession(ctx)
 	if err != nil {
 		return nil, 0, err
@@ -269,10 +320,6 @@ func (c *Client) getSessionWithGen(ctx context.Context) (*yamux.Session, uint64,
 }
 
 func (c *Client) establishNewSession(ctx context.Context) (*yamux.Session, *tls.Conn, error) {
-	var tunnelConn net.Conn
-	var err error
-
-	// If no relay configured, scan to find one
 	if c.config.RelayURI == "" {
 		if c.isFixedRelay {
 			return nil, nil, errors.New("relay URI missing in fixed configuration")
@@ -284,44 +331,37 @@ func (c *Client) establishNewSession(ctx context.Context) (*yamux.Session, *tls.
 			return nil, nil, fmt.Errorf("discovery failed: %w", err)
 		}
 
-		// Save the discovered relay for future reconnections
 		c.config.RelayURI = relayURI
 		c.relayAddr, c.relayID, _ = parseRelayURI(relayURI)
 
-		// Complete BEP handshake
 		session, bepConn, err := c.completeBEPHandshake(tunnelConn)
 		if err != nil {
 			tunnelConn.Close()
 			return nil, nil, err
 		}
-
 		return session, bepConn, nil
 	}
 
-	// Connect to known relay with retries
+	// Connect to known relay
 	for attempt := 0; attempt < 3; attempt++ {
-		select {
-		case <-ctx.Done():
+		if ctx.Err() != nil {
 			return nil, nil, ctx.Err()
-		default:
 		}
 
-		tunnelConn, err = c.connectToKnownRelay(ctx)
+		tunnelConn, err := c.connectToKnownRelay(ctx)
 		if err != nil {
 			c.log("warn", fmt.Sprintf("Connection attempt %d failed: %v", attempt+1, err))
-
 			if attempt < 2 {
-				time.Sleep(time.Duration(attempt+1) * 200 * time.Millisecond)
+				time.Sleep(500 * time.Millisecond)
 				continue
 			}
-
-			// If not a fixed relay, try rescanning
+			
 			if !c.isFixedRelay {
-				c.log("info", "Clearing cached relay to re-scan...")
+				c.log("info", "Known relay seems down, re-scanning...")
 				c.config.RelayURI = ""
 				c.relayAddr = ""
 				c.relayID = ""
-				return c.establishNewSession(ctx) // Recursive call to scan
+				return c.establishNewSession(ctx)
 			}
 			return nil, nil, err
 		}
@@ -330,9 +370,8 @@ func (c *Client) establishNewSession(ctx context.Context) (*yamux.Session, *tls.
 		if err != nil {
 			tunnelConn.Close()
 			c.log("warn", fmt.Sprintf("Handshake attempt %d failed: %v", attempt+1, err))
-
 			if attempt < 2 {
-				time.Sleep(time.Duration(attempt+1) * 200 * time.Millisecond)
+				time.Sleep(500 * time.Millisecond)
 				continue
 			}
 			return nil, nil, err
@@ -341,17 +380,66 @@ func (c *Client) establishNewSession(ctx context.Context) (*yamux.Session, *tls.
 		return session, bepConn, nil
 	}
 
-	return nil, nil, errors.New("failed to establish session after retries")
+	return nil, nil, errors.New("failed to connect")
 }
 
-// scanAndConnect finds the target device and returns a ready tunnel connection
 func (c *Client) scanAndConnect(ctx context.Context) (net.Conn, string, error) {
-	c.log("info", "Fetching public relay list...")
-	// EXPLICIT CAST FIX: Convert tunnel.DialerFunc to relay.Dialer
-	relays, err := relay.Discover(ctx, relay.Dialer(c.config.Dialer))
-	if err != nil {
-		return nil, "", fmt.Errorf("fetch relays: %w", err)
+	var relays []relay.Relay
+	var err error
+	
+	// 1. Check Cache
+	relayCacheMu.RLock()
+	if len(relayCache) > 0 && time.Since(relayCacheTime) < relayCacheTTL {
+		relays = make([]relay.Relay, len(relayCache))
+		copy(relays, relayCache)
 	}
+	relayCacheMu.RUnlock()
+
+	// 2. Network Fetch with Retries
+	if len(relays) == 0 {
+		c.log("info", "Fetching public relay list...")
+		
+		// Try 3 times, short timeouts, to survive packet loss/DNS blips
+		for i := 0; i < 3; i++ {
+			fetchCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+			relays, err = relay.Discover(fetchCtx, relay.Dialer(c.config.Dialer))
+			cancel()
+			
+			if err == nil && len(relays) > 0 {
+				break
+			}
+			if i < 2 {
+				time.Sleep(200 * time.Millisecond)
+			}
+		}
+
+		if err != nil {
+			// Fallback to stale cache if available
+			relayCacheMu.RLock()
+			if len(relayCache) > 0 {
+				c.log("warn", "Fetch failed, using stale cache backup.")
+				relays = make([]relay.Relay, len(relayCache))
+				copy(relays, relayCache)
+				err = nil
+			}
+			relayCacheMu.RUnlock()
+		}
+		
+		if err != nil {
+			return nil, "", fmt.Errorf("fetch relays: %w", err)
+		}
+
+		relayCacheMu.Lock()
+		relayCache = relays
+		relayCacheTime = time.Now()
+		relayCacheMu.Unlock()
+	}
+
+	// 3. Shuffle
+	rng := rand.New(rand.NewSource(time.Now().UnixNano()))
+	rng.Shuffle(len(relays), func(i, j int) {
+		relays[i], relays[j] = relays[j], relays[i]
+	})
 
 	c.log("info", fmt.Sprintf("Scanning %d relays for device %x...", len(relays), c.targetBytes[:4]))
 
@@ -365,54 +453,62 @@ func (c *Client) scanAndConnect(ctx context.Context) (net.Conn, string, error) {
 	defer scanCancel()
 
 	var found int32
-
-	// Reduce worker count to avoid network saturation and FD limits.
-	workers := 100
-	if len(relays) < workers {
-		workers = len(relays)
-	}
-
-	work := make(chan relay.Relay, len(relays))
-	for _, r := range relays {
-		work <- r
-	}
-	close(work)
-
+	
+	// 4. Burst Pacing Strategy
+	// We want to launch ALL 700 relays within ~2 seconds.
+	// Rate = 1 dial every 3ms.
+	// 700 * 3ms = 2.1s total launch time.
+	// This prevents head-of-line blocking by slow relays.
+	
+	concurrency := 512 // High limit to allow pending connects
+	sem := make(chan struct{}, concurrency)
 	var wg sync.WaitGroup
-	wg.Add(workers)
 
-	for i := 0; i < workers; i++ {
-		go func() {
+	for _, r := range relays {
+		if atomic.LoadInt32(&found) != 0 {
+			break
+		}
+
+		wg.Add(1)
+		
+		// Pacer: 3ms
+		time.Sleep(3 * time.Millisecond)
+
+		go func(r relay.Relay) {
 			defer wg.Done()
-			for r := range work {
-				if atomic.LoadInt32(&found) != 0 {
-					return
-				}
-
-				select {
-				case <-scanCtx.Done():
-					return
-				default:
-				}
-
-				conn, err := c.tryRelayAndConnect(scanCtx, r)
-				if err != nil {
-					continue
-				}
-
-				if atomic.CompareAndSwapInt32(&found, 0, 1) {
-					select {
-					case results <- result{conn: conn, relayURI: r.URL}:
-						scanCancel()
-					default:
-						conn.Close()
-					}
-				} else {
-					conn.Close()
-				}
+			
+			select {
+			case sem <- struct{}{}:
+			case <-scanCtx.Done():
 				return
 			}
-		}()
+			defer func() { <-sem }()
+
+			if atomic.LoadInt32(&found) != 0 {
+				return
+			}
+
+			// Dial Timeout: 2.5s is enough for TCP, but fast enough to fail
+			// Total probe time allowed: 6s (includes negotiation)
+			probeCtx, cancel := context.WithTimeout(scanCtx, 6*time.Second)
+			defer cancel()
+
+			conn, err := c.tryRelayAndConnect(probeCtx, r)
+			if err != nil {
+				return
+			}
+
+			if atomic.CompareAndSwapInt32(&found, 0, 1) {
+				select {
+				case results <- result{conn: conn, relayURI: r.URL}:
+					scanCancel()
+				default:
+					conn.Close()
+				}
+			} else {
+				conn.Close()
+			}
+		}(r)
 	}
 
 	go func() {
@@ -425,48 +521,41 @@ func (c *Client) scanAndConnect(ctx context.Context) (net.Conn, string, error) {
 		if !ok {
 			return nil, "", errors.New("target device not found on any relay")
 		}
-
 		u, _ := url.Parse(res.relayURI)
 		c.log("ok", fmt.Sprintf("Found device on relay: %s", u.Host))
-
 		return res.conn, res.relayURI, nil
 	case <-ctx.Done():
 		return nil, "", ctx.Err()
 	}
 }
 
-// tryRelayAndConnect connects to a relay, requests connection to target, and returns the tunnel
 func (c *Client) tryRelayAndConnect(ctx context.Context, r relay.Relay) (net.Conn, error) {
-	// Increased timeout to 15s to allow for full relay session establishment.
-	probeCtx, probeCancel := context.WithTimeout(ctx, 15*time.Second)
-	defer probeCancel()
-
 	host, _, err := net.SplitHostPort(r.Host)
 	if err != nil {
 		host = r.Host
 	}
-
 	addr := net.JoinHostPort(r.Host, r.Port)
 
+	// Stage 1: TCP Dial
+	// 2.5s is the cutoff for a "responsive" relay.
 	var conn net.Conn
-
+	
 	if c.config.Dialer != nil {
-		conn, err = c.config.Dialer(probeCtx, "tcp", addr)
+		conn, err = c.config.Dialer(ctx, "tcp", addr)
 	} else {
-		dialer := &net.Dialer{}
-		conn, err = dialer.DialContext(probeCtx, "tcp", addr)
+		d := &net.Dialer{Timeout: 2500 * time.Millisecond}
+		conn, err = d.DialContext(ctx, "tcp", addr)
 	}
-
 	if err != nil {
 		return nil, err
 	}
-
-	if deadline, ok := probeCtx.Deadline(); ok {
-		conn.SetDeadline(deadline)
-	}
-
 	network.OptimizeConn(conn)
 
+	// Set deadline for the rest of the handshake
+	if deadline, ok := ctx.Deadline(); ok {
+		conn.SetDeadline(deadline)
+	}
+	
 	tlsConfig := c.tlsConfig.Clone()
 	tlsConfig.ServerName = host
 
@@ -476,14 +565,15 @@ func (c *Client) tryRelayAndConnect(ctx context.Context, r relay.Relay) (net.Con
 		return nil, err
 	}
 
-	// Join relay
+	// Stage 2: Negotiation
 	if err := protocol.WriteMessage(tlsConn, protocol.MsgJoinRelayRequest, []byte{0, 0, 0, 0}); err != nil {
 		tlsConn.Close()
 		return nil, err
 	}
 
 	// Read Join Response
-	for {
+	gotJoin := false
+	for !gotJoin {
 		msgType, body, err := protocol.ReadMessage(tlsConn)
 		if err != nil {
 			tlsConn.Close()
@@ -498,13 +588,13 @@ func (c *Client) tryRelayAndConnect(ctx context.Context, r relay.Relay) (net.Con
 				tlsConn.Close()
 				return nil, errors.New("join rejected")
 			}
+			gotJoin = true
 			break
 		}
 		tlsConn.Close()
 		return nil, errors.New("unexpected message")
 	}
 
-	// Send Connect Request
 	if err := protocol.WriteMessage(tlsConn, protocol.MsgConnectRequest, protocol.XDRBytes(c.targetBytes)); err != nil {
 		tlsConn.Close()
 		return nil, err
@@ -524,8 +614,13 @@ func (c *Client) tryRelayAndConnect(ctx context.Context, r relay.Relay) (net.Con
 		}
 
 		if msgType == protocol.MsgResponse {
-			tlsConn.Close()
-			return nil, errors.New("target not found")
+			if len(body) >= 4 {
+				if code := int32(binary.BigEndian.Uint32(body[:4])); code != 0 {
+					tlsConn.Close()
+					return nil, errors.New("target not found")
+				}
+			}
+			continue
 		}
 
 		if msgType == protocol.MsgSessionInvitation {
@@ -535,7 +630,6 @@ func (c *Client) tryRelayAndConnect(ctx context.Context, r relay.Relay) (net.Con
 				return nil, err
 			}
 
-			// Verify invitation is from our target
 			if len(inv.From) != len(c.targetBytes) {
 				continue
 			}
@@ -550,10 +644,8 @@ func (c *Client) tryRelayAndConnect(ctx context.Context, r relay.Relay) (net.Con
 				continue
 			}
 
-			// Close relay connection - we're done with it
 			tlsConn.Close()
 
-			// Connect to session
 			var sessionAddr string
 			if len(inv.Address) > 0 && !net.IP(inv.Address).IsUnspecified() {
 				sessionAddr = net.JoinHostPort(net.IP(inv.Address).String(), fmt.Sprintf("%d", inv.Port))
@@ -562,12 +654,13 @@ func (c *Client) tryRelayAndConnect(ctx context.Context, r relay.Relay) (net.Con
 			}
 
 			var sConn net.Conn
-
+			
+			// Dial the session
 			if c.config.Dialer != nil {
 				sConn, err = c.config.Dialer(ctx, "tcp", sessionAddr)
 			} else {
-				dialer := &net.Dialer{Timeout: 5 * time.Second}
-				sConn, err = dialer.DialContext(ctx, "tcp", sessionAddr)
+				d := &net.Dialer{Timeout: 4 * time.Second}
+				sConn, err = d.DialContext(ctx, "tcp", sessionAddr)
 			}
 
 			if err != nil {
@@ -609,7 +702,6 @@ func (c *Client) tryRelayAndConnect(ctx context.Context, r relay.Relay) (net.Con
 	}
 }
 
-// connectToKnownRelay connects to a known relay and returns the tunnel connection
 func (c *Client) connectToKnownRelay(ctx context.Context) (net.Conn, error) {
 	relayConn, err := c.connectToRelay(ctx)
 	if err != nil {
@@ -622,7 +714,7 @@ func (c *Client) connectToKnownRelay(ctx context.Context) (net.Conn, error) {
 	}
 
 	for {
-		relayConn.SetReadDeadline(time.Now().Add(30 * time.Second))
+		relayConn.SetReadDeadline(time.Now().Add(10 * time.Second))
 		msgType, body, err := protocol.ReadMessage(relayConn)
 		if err != nil {
 			relayConn.Close()
@@ -635,14 +727,13 @@ func (c *Client) connectToKnownRelay(ctx context.Context) (net.Conn, error) {
 		}
 
 		if msgType == protocol.MsgResponse {
-			relayConn.Close()
 			if len(body) >= 4 {
-				code := int32(binary.BigEndian.Uint32(body[:4]))
-				if code != 0 {
+				if code := int32(binary.BigEndian.Uint32(body[:4])); code != 0 {
+					relayConn.Close()
 					return nil, fmt.Errorf("connect rejected: code %d", code)
 				}
 			}
-			return nil, errors.New("unexpected response")
+			continue
 		}
 
 		if msgType == protocol.MsgSessionInvitation {
@@ -652,7 +743,6 @@ func (c *Client) connectToKnownRelay(ctx context.Context) (net.Conn, error) {
 				return nil, err
 			}
 
-			// Verify invitation
 			if len(inv.From) != len(c.targetBytes) {
 				continue
 			}
@@ -681,7 +771,7 @@ func (c *Client) connectToKnownRelay(ctx context.Context) (net.Conn, error) {
 			if c.config.Dialer != nil {
 				sConn, err = c.config.Dialer(ctx, "tcp", sessionAddr)
 			} else {
-				dialer := &net.Dialer{Timeout: 10 * time.Second}
+				dialer := &net.Dialer{Timeout: 5 * time.Second}
 				sConn, err = dialer.DialContext(ctx, "tcp", sessionAddr)
 			}
 
@@ -695,7 +785,7 @@ func (c *Client) connectToKnownRelay(ctx context.Context) (net.Conn, error) {
 				return nil, fmt.Errorf("session join failed: %w", err)
 			}
 
-			sConn.SetReadDeadline(time.Now().Add(10 * time.Second))
+			sConn.SetReadDeadline(time.Now().Add(5 * time.Second))
 			mType, mBody, err := protocol.ReadMessage(sConn)
 			sConn.SetReadDeadline(time.Time{})
 
