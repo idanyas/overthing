@@ -10,6 +10,7 @@ import (
 	"math/rand"
 	"net"
 	"net/url"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -453,14 +454,16 @@ func (c *Client) scanAndConnect(ctx context.Context) (net.Conn, string, error) {
 	defer scanCancel()
 
 	var found int32
+	var errCountDial int32
+	var errCountTLS int32
+	var errCountNotFound int32
+	var errCountOther int32
 	
-	// 4. Burst Pacing Strategy
-	// We want to launch ALL 700 relays within ~2 seconds.
-	// Rate = 1 dial every 3ms.
-	// 700 * 3ms = 2.1s total launch time.
-	// This prevents head-of-line blocking by slow relays.
-	
-	concurrency := 512 // High limit to allow pending connects
+	// FIX: Conservative tuning for First Attempt Success
+	// Concurrency: 50 (Low enough to prevent Router/OS table exhaustion)
+	// Pacing: 20ms (Prevents SYN flood detection)
+	// Timeout: 2.5s (Sufficient for global latency)
+	concurrency := 50
 	sem := make(chan struct{}, concurrency)
 	var wg sync.WaitGroup
 
@@ -471,8 +474,8 @@ func (c *Client) scanAndConnect(ctx context.Context) (net.Conn, string, error) {
 
 		wg.Add(1)
 		
-		// Pacer: 3ms
-		time.Sleep(3 * time.Millisecond)
+		// Pacer: 20ms
+		time.Sleep(20 * time.Millisecond)
 
 		go func(r relay.Relay) {
 			defer wg.Done()
@@ -488,13 +491,23 @@ func (c *Client) scanAndConnect(ctx context.Context) (net.Conn, string, error) {
 				return
 			}
 
-			// Dial Timeout: 2.5s is enough for TCP, but fast enough to fail
-			// Total probe time allowed: 6s (includes negotiation)
-			probeCtx, cancel := context.WithTimeout(scanCtx, 6*time.Second)
+			// Dial Timeout: 2.5s 
+			probeCtx, cancel := context.WithTimeout(scanCtx, 2500*time.Millisecond)
 			defer cancel()
 
 			conn, err := c.tryRelayAndConnect(probeCtx, r)
 			if err != nil {
+				// Diagnostic counting
+				msg := err.Error()
+				if strings.Contains(msg, "dial") || strings.Contains(msg, "timeout") {
+					atomic.AddInt32(&errCountDial, 1)
+				} else if strings.Contains(msg, "tls") || strings.Contains(msg, "certificate") {
+					atomic.AddInt32(&errCountTLS, 1)
+				} else if strings.Contains(msg, "target not found") {
+					atomic.AddInt32(&errCountNotFound, 1)
+				} else {
+					atomic.AddInt32(&errCountOther, 1)
+				}
 				return
 			}
 
@@ -519,6 +532,12 @@ func (c *Client) scanAndConnect(ctx context.Context) (net.Conn, string, error) {
 	select {
 	case res, ok := <-results:
 		if !ok {
+			// SCAN FAILED - Log detailed diagnostics
+			c.log("warn", fmt.Sprintf("Scan Stats | Dial/Net Fail: %d | Not Found: %d | TLS/Other: %d", 
+				atomic.LoadInt32(&errCountDial), 
+				atomic.LoadInt32(&errCountNotFound),
+				atomic.LoadInt32(&errCountTLS) + atomic.LoadInt32(&errCountOther)))
+				
 			return nil, "", errors.New("target device not found on any relay")
 		}
 		u, _ := url.Parse(res.relayURI)
@@ -537,12 +556,12 @@ func (c *Client) tryRelayAndConnect(ctx context.Context, r relay.Relay) (net.Con
 	addr := net.JoinHostPort(r.Host, r.Port)
 
 	// Stage 1: TCP Dial
-	// 2.5s is the cutoff for a "responsive" relay.
 	var conn net.Conn
 	
 	if c.config.Dialer != nil {
 		conn, err = c.config.Dialer(ctx, "tcp", addr)
 	} else {
+		// Use specific timeout for TCP connection too (matched to probe timeout)
 		d := &net.Dialer{Timeout: 2500 * time.Millisecond}
 		conn, err = d.DialContext(ctx, "tcp", addr)
 	}
@@ -584,9 +603,12 @@ func (c *Client) tryRelayAndConnect(ctx context.Context, r relay.Relay) (net.Con
 			continue
 		}
 		if msgType == protocol.MsgResponse {
-			if len(body) >= 4 && int32(binary.BigEndian.Uint32(body[:4])) != 0 {
-				tlsConn.Close()
-				return nil, errors.New("join rejected")
+			if len(body) >= 4 {
+				code := int32(binary.BigEndian.Uint32(body[:4]))
+				if code != 0 {
+					tlsConn.Close()
+					return nil, fmt.Errorf("join rejected: code %d", code)
+				}
 			}
 			gotJoin = true
 			break
