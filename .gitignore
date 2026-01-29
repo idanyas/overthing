@@ -1,0 +1,27 @@
+tunnel
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+Test binary
+*.test
+Coverage
+*.out
+*.prof
+vendor/
+IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+*.key
+.tunnel-key
+OS files
+.DS_Store
+Thumbs.db
+output_*.md
+output.md
+watch.sh
+apply.sh

@@ -1,0 +1,639 @@
+# Syncthing Network Protocol Specification
+
+This document provides a complete specification for communicating with the Syncthing network, specifically focusing on the Relay Protocol and the Block Exchange Protocol (BEP). It is derived directly from the Syncthing source code to ensure accuracy for clean-room implementations.
+
+---
+
+## 1. Device Identity & Security
+
+Syncthing devices are identified by a **Device ID**, which is a checksummed encoding of the SHA-256 hash of the device's TLS certificate.
+
+### 1.1 Certificate Requirements
+*   **Type**: X.509.
+*   **Keys**: ECDSA (P-256, P-384, P-521), Ed25519, or RSA. Ed25519 is modern standard.
+*   **Authentication**: Mutual TLS (mTLS) is required for all connections (Relay and BEP).
+
+### 1.2 Device ID Algorithm
+
+1.  **Hash**: Compute `SHA-256(Cert.Raw)`. Result: 32 bytes.
+2.  **Base32**: Encode the hash using Base32 (RFC 4648), removing padding (`=`). Result: 52 characters.
+3.  **Luhn-32 Check digits**:
+    *   Split the 52 characters into 4 chunks of 13 characters.
+    *   For each chunk, calculate one check digit using the Luhn mod 32 algorithm (alphabet: `ABCDEFGHIJKLMNOPQRSTUVWXYZ234567`).
+    *   Append the check digit to the chunk.
+    *   Concatenate chunks. Result: 56 characters.
+4.  **Presentation**: Optionally insert `-` every 7 characters.
+
+---
+
+## 2. Relay Protocol
+
+This protocol is used to tunnel connections when direct connectivity is impossible. The Relay Server acts as a blind packet forwarder.
+
+*   **Default Port**: 22067
+*   **ALPN**: `bep-relay`
+*   **Transport**: TCP (usually), TLS.
+*   **Encoding**: XDR (RFC 4506), Big Endian, 4-byte alignment.
+
+### 2.1 Header Format
+Every message starts with a 12-byte header.
+
+| Offset | Type     | Value        | Description |
+|:-------|:---------|:-------------|:------------|
+| 0      | `uint32` | `0x9E79BC40` | Magic Number |
+| 4      | `int32`  | *Enum*       | Message Type |
+| 8      | `int32`  | *Length*     | Length of the message body (including XDR padding) |
+
+### 2.2 Message Types
+
+| ID | Name | Structure (XDR) | Description |
+|:---|:-----|:----------------|:------------|
+| 0 | `Ping` | *(Empty)* | Keepalive. |
+| 1 | `Pong` | *(Empty)* | Reply to Ping. |
+| 2 | `JoinRelayRequest` | `string Token` | Request to join the relay. Token is empty for public relays. |
+| 3 | `JoinSessionRequest` | `opaque Key<32>` | Join a specific session using a key received in an invitation. |
+| 4 | `Response` | `int32 Code`<br>`string Message` | Generic response. Code 0 is success. |
+| 5 | `ConnectRequest` | `opaque ID<32>` | Request a connection to a specific Device ID (raw 32 bytes). |
+| 6 | `SessionInvitation` | `opaque From<32>`<br>`opaque Key<32>`<br>`opaque Address<32>`<br>`uint32 Port`<br>`bool ServerSocket` | Sent by relay to indicate an incoming connection request. |
+| 7 | `RelayFull` | *(Empty)* | Error indicating relay cannot accept new clients. |
+
+**Notes**:
+*   `string`: 4-byte length, followed by bytes, padded to 4 bytes.
+*   `opaque`: Same as string, but treated as raw bytes. `<32>` denotes max length.
+*   `bool`: 4-byte integer (0=false, 1=true).
+*   `SessionInvitation.Port`: Although represented as `uint16` in logic, it occupies 4 bytes in XDR.
+
+### 2.3 Connection Flow
+1.  **Connect** via TCP/TLS to Relay.
+2.  **Verify** Relay Certificate: The Device ID derived from the relay's certificate must match the ID provided in the relay URI (`relay://<host>:22067?id=<ID>`).
+3.  **Join**: Send `JoinRelayRequest`. Expect `Response(0)`.
+4.  **Wait**: Read loop. Maintain keepalive with `Ping`/`Pong`.
+5.  **Connect (Outgoing)**: Send `ConnectRequest`. Receive `SessionInvitation`.
+6.  **Accept (Incoming)**: Receive `SessionInvitation`.
+
+### 2.4 Tunnel Establishment
+Upon receiving a `SessionInvitation`:
+1.  Connect to the IP specified in `Address` (or the Relay IP if empty) on `Port`.
+2.  Send `JoinSessionRequest` with the `Key` from the invitation.
+3.  Expect `Response(0)`.
+4.  **Upgrade**: The TCP connection is now a transparent tunnel. Immediately start the **BEP** protocol (TLS handshake) over this connection.
+
+---
+
+## 3. Block Exchange Protocol (BEP)
+
+This is the primary sync protocol. It runs inside a TLS connection (Direct or Relayed).
+
+*   **Default Port**: 22000
+*   **ALPN**: `bep/1.0`
+*   **Encoding**: Google Protocol Buffers (Protobuf).
+
+### 3.1 The Hello Message
+Sent immediately upon connection establishment. Unique framing.
+
+**Structure**:
+*   `uint32 Magic` (`0x2EA7D90B`)
+*   `uint16 Length` (Length of Protobuf payload)
+*   `bytes Payload` (Marshaled `Hello` message)
+
+**Protobuf**:
+```protobuf
+message Hello {
+    string device_name = 1;
+    string client_name = 2;
+    string client_version = 3;
+    int32 num_connections = 4; // Unused
+    int64 timestamp = 5;       // Unix nanoseconds
+}
+```
+
+### 3.2 Standard Message Framing
+All subsequent messages use this framing.
+
+**Structure**:
+*   `uint16 HeaderLength`
+*   `bytes Header` (Marshaled `Header` message)
+*   `uint32 BodyLength`
+*   `bytes Body` (The actual message payload)
+
+**Header Protobuf**:
+```protobuf
+message Header {
+    MessageType type = 1;
+    MessageCompression compression = 2;
+}
+
+enum MessageType {
+    CLUSTER_CONFIG = 0;
+    INDEX = 1;
+    INDEX_UPDATE = 2;
+    REQUEST = 3;
+    RESPONSE = 4;
+    DOWNLOAD_PROGRESS = 5;
+    PING = 6;
+    CLOSE = 7;
+}
+
+enum MessageCompression {
+    NONE = 0;
+    LZ4 = 1;
+}
+```
+
+### 3.3 Compression
+If `Header.compression` is `LZ4 (1)`:
+1.  The `Body` starts with a `uint32` (Big Endian) representing the **uncompressed size**.
+2.  The rest of the `Body` is the LZ4 block.
+
+### 3.4 Key Message Definitions
+
+**ClusterConfig (Type 0)**
+Exchanges folder metadata.
+```protobuf
+message ClusterConfig {
+    repeated Folder folders = 1;
+}
+message Folder {
+    string id = 1;
+    string label = 2;
+    int32 type = 3; // 0: SendRecv, 1: SendOnly, 2: RecvOnly
+    repeated Device devices = 16;
+}
+message Device {
+    bytes id = 1; // 32-byte raw Device ID
+    string name = 2;
+    repeated string addresses = 3;
+    int32 compression = 4; // 0: Metadata, 1: Never, 2: Always
+    string cert_name = 5;
+    int64 max_sequence = 6;
+    bool introducer = 7;
+    uint64 index_id = 8;
+    bool skip_introduction_removals = 9;
+    bytes encryption_password_token = 10;
+}
+```
+
+**Index / IndexUpdate (Type 1 / 2)**
+Exchanges file lists. `Index` is full, `IndexUpdate` is delta.
+```protobuf
+message Index {
+    string folder = 1;
+    repeated FileInfo files = 2;
+}
+message FileInfo {
+    string name = 1;
+    int32 type = 2;         // 0: File, 1: Dir, 4: Symlink
+    int64 size = 3;
+    uint32 permissions = 4; // Unix mode bits
+    int64 modified_s = 5;
+    bool deleted = 6;
+    bool invalid = 7;
+    bool no_permissions = 8;
+    Vector version = 9;
+    int64 sequence = 10;
+    int32 modified_ns = 11;
+    int32 block_size = 13;
+    repeated BlockInfo blocks = 16;
+    bytes symlink_target = 17;
+}
+message BlockInfo {
+    int64 offset = 1;
+    int32 size = 2;
+    bytes hash = 3; // SHA-256
+}
+message Vector {
+    repeated Counter counters = 1;
+}
+message Counter {
+    uint64 id = 1; // Short Device ID
+    uint64 value = 2;
+}
+```
+
+**Request (Type 3)** & **Response (Type 4)**
+Data transfer.
+```protobuf
+message Request {
+    int32 id = 1;
+    string folder = 2;
+    string name = 3;
+    int64 offset = 4;
+    int32 size = 5;
+    bytes hash = 6;
+    bool from_temporary = 7;
+}
+message Response {
+    int32 id = 1;
+    bytes data = 2;
+    int32 code = 3; // 0: OK, 1: Generic Error, 2: No Such File, 3: Invalid
+}
+```
+
+---
+
+## 4. Complete Go Client Implementation
+
+This standalone program generates a valid identity, connects to a public relay, establishes a session, and performs the BEP handshake.
+
+```go
+package main
+
+import (
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/sha256"
+	"crypto/tls"
+	"crypto/x509"
+	"encoding/base32"
+	"encoding/binary"
+	"errors"
+	"fmt"
+	"io"
+	"log"
+	"math/big"
+	"net"
+	"net/url"
+	"strings"
+	"time"
+
+	"google.golang.org/protobuf/proto"
+)
+
+// --- Configuration ---
+// Public relay URI (example from https://relays.syncthing.net/endpoint)
+const RelayURI = "relay://198.211.120.59:22067/?id=F6UOFEF-IG3F7O5-7VTPVFJ-C6TKTH4-TKOFVKK-2EKYZLL-ZY47V4U-N4RCYAN"
+
+const (
+	RelayMagic = 0x9E79BC40
+	HelloMagic = 0x2EA7D90B
+)
+
+func main() {
+	log.SetFlags(log.Ltime | log.Lmicroseconds)
+
+	// 1. Generate a valid Syncthing Identity
+	cert, _, idStr := generateIdentity()
+	log.Printf("Generated Device ID: %s", idStr)
+
+	// 2. Connect to Relay
+	u, _ := url.Parse(RelayURI)
+	expectedRelayID := u.Query().Get("id")
+
+	conn, err := net.Dial("tcp", u.Host)
+	if err != nil {
+		log.Fatal(err)
+	}
+	
+	tlsConfig := &tls.Config{
+		Certificates:       []tls.Certificate{cert},
+		InsecureSkipVerify: true, // We verify the ID manually below
+		NextProtos:         []string{"bep-relay"},
+	}
+	tlsConn := tls.Client(conn, tlsConfig)
+	if err := tlsConn.Handshake(); err != nil {
+		log.Fatal("TLS Error:", err)
+	}
+
+	// 3. Verify Relay Identity
+	peerCerts := tlsConn.ConnectionState().PeerCertificates
+	if len(peerCerts) == 0 {
+		log.Fatal("No peer certs")
+	}
+	remoteID := getDeviceID(peerCerts[0].Raw)
+	if normalizeID(remoteID) != normalizeID(expectedRelayID) {
+		log.Fatalf("ID Mismatch. Expected %s, got %s", expectedRelayID, remoteID)
+	}
+	log.Println("Relay authenticated.")
+
+	// 4. Join Relay (Type 2: JoinRelayRequest)
+	// XDR: String "Token" (empty). 4 byte len (0) + 0 bytes data + 0 padding.
+	if err := relayWrite(tlsConn, 2, []byte{0, 0, 0, 0}); err != nil {
+		log.Fatal(err)
+	}
+
+	// 5. Read Join Response (Type 4)
+	t, body, err := relayRead(tlsConn)
+	if err != nil {
+		log.Fatal(err)
+	}
+	if t != 4 {
+		log.Fatalf("Unexpected message type %d", t)
+	}
+	if code := int32(binary.BigEndian.Uint32(body[:4])); code != 0 {
+		log.Fatalf("Relay rejected join: code %d", code)
+	}
+	log.Println("Joined relay successfully. Waiting for invitations...")
+
+	// 6. Read loop (Ping/Pong/Invitation)
+	var inv Invitation
+	for {
+		t, body, err := relayRead(tlsConn)
+		if err != nil {
+			log.Fatal(err)
+		}
+
+		if t == 0 { // Ping
+			log.Println("Ping -> Pong")
+			relayWrite(tlsConn, 1, nil)
+		} else if t == 6 { // SessionInvitation
+			inv = decodeInvitation(body)
+			log.Printf("Received Invitation from %x...", inv.From[:5])
+			break
+		}
+	}
+
+	// 7. Establish Tunnel
+	// SessionInvitation Address is often empty (use relay IP)
+	tunnelIP := net.IP(inv.Address)
+	if len(tunnelIP) == 0 || tunnelIP.IsUnspecified() {
+		host, _, _ := net.SplitHostPort(u.Host)
+		tunnelIP = net.ParseIP(host)
+	}
+	tunnelAddr := fmt.Sprintf("%s:%d", tunnelIP, inv.Port)
+	
+	log.Printf("Dialing tunnel: %s", tunnelAddr)
+	sessConn, err := net.Dial("tcp", tunnelAddr)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	// 8. Authenticate Tunnel (Type 3: JoinSessionRequest)
+	if err := relayWrite(sessConn, 3, xdrBytes(inv.Key)); err != nil {
+		log.Fatal(err)
+	}
+
+	// 9. Read Tunnel Response (Type 4)
+	t, body, err = relayRead(sessConn)
+	if err != nil {
+		log.Fatal(err)
+	}
+	if t != 4 || int32(binary.BigEndian.Uint32(body[:4])) != 0 {
+		log.Fatal("Tunnel join failed")
+	}
+
+	// 10. BEP Handshake (TLS over Tunnel)
+	bepConfig := &tls.Config{
+		Certificates:       []tls.Certificate{cert},
+		InsecureSkipVerify: true,
+		NextProtos:         []string{"bep/1.0"},
+		ClientAuth:         tls.RequestClientCert,
+	}
+	
+	var bepConn *tls.Conn
+	if inv.ServerSocket {
+		bepConn = tls.Server(sessConn, bepConfig)
+	} else {
+		bepConn = tls.Client(sessConn, bepConfig)
+	}
+
+	if err := bepConn.Handshake(); err != nil {
+		log.Fatal("BEP TLS Handshake failed:", err)
+	}
+	log.Println("BEP TLS Established.")
+
+	// 11. Send BEP Hello
+	if err := sendBEPHello(bepConn); err != nil {
+		log.Fatal(err)
+	}
+
+	// 12. Read BEP Messages
+	readBEPStream(bepConn)
+}
+
+// --- Helper Functions ---
+
+func normalizeID(s string) string {
+	return strings.ReplaceAll(s, "-", "")
+}
+
+// --- Relay XDR Helpers ---
+
+type Invitation struct {
+	From, Key, Address []byte
+	Port               uint16
+	ServerSocket       bool
+}
+
+func relayWrite(w io.Writer, typ int32, payload []byte) error {
+	header := make([]byte, 12)
+	binary.BigEndian.PutUint32(header[0:], RelayMagic)
+	binary.BigEndian.PutUint32(header[4:], uint32(typ))
+	binary.BigEndian.PutUint32(header[8:], uint32(len(payload)))
+	
+	if _, err := w.Write(header); err != nil { return err }
+	if len(payload) > 0 {
+		if _, err := w.Write(payload); err != nil { return err }
+	}
+	return nil
+}
+
+func relayRead(r io.Reader) (int32, []byte, error) {
+	header := make([]byte, 12)
+	if _, err := io.ReadFull(r, header); err != nil { return 0, nil, err }
+	
+	if binary.BigEndian.Uint32(header[0:]) != RelayMagic {
+		return 0, nil, errors.New("invalid magic")
+	}
+	
+	length := binary.BigEndian.Uint32(header[8:])
+	data := make([]byte, length)
+	if _, err := io.ReadFull(r, data); err != nil { return 0, nil, err }
+	
+	return int32(binary.BigEndian.Uint32(header[4:])), data, nil
+}
+
+func xdrBytes(b []byte) []byte {
+	l := len(b)
+	pad := (4 - (l % 4)) % 4
+	out := make([]byte, 4+l+pad)
+	binary.BigEndian.PutUint32(out[0:], uint32(l))
+	copy(out[4:], b)
+	return out
+}
+
+func decodeInvitation(d []byte) Invitation {
+	offset := 0
+	readOpaque := func() []byte {
+		l := int(binary.BigEndian.Uint32(d[offset:]))
+		val := d[offset+4 : offset+4+l]
+		pad := (4 - (l % 4)) % 4
+		offset += 4 + l + pad
+		return val
+	}
+	
+	from := readOpaque()
+	key := readOpaque()
+	addr := readOpaque()
+	port := uint16(binary.BigEndian.Uint32(d[offset:])) // XDR int
+	offset += 4
+	ss := binary.BigEndian.Uint32(d[offset:]) == 1 // XDR bool
+	
+	return Invitation{from, key, addr, port, ss}
+}
+
+// --- BEP Helpers ---
+
+func sendBEPHello(w io.Writer) error {
+	// Construct protobuf manually for simplicity
+	// Field 1 (string): 0A len ...
+	// Field 5 (varint): 28 value
+	
+	name := "GoRef"
+	ts := uint64(time.Now().UnixNano())
+	
+	pb := make([]byte, 0, 32)
+	pb = append(pb, 0x0A, uint8(len(name)))
+	pb = append(pb, []byte(name)...)
+	pb = append(pb, 0x28)
+	pb = appendVarint(pb, ts)
+	
+	header := make([]byte, 6)
+	binary.BigEndian.PutUint32(header[0:], HelloMagic)
+	binary.BigEndian.PutUint16(header[4:], uint16(len(pb)))
+	
+	if _, err := w.Write(header); err != nil { return err }
+	_, err := w.Write(pb)
+	return err
+}
+
+func readBEPStream(r io.Reader) {
+	// 1. Read Hello
+	head := make([]byte, 6)
+	if _, err := io.ReadFull(r, head); err != nil { return }
+	
+	if binary.BigEndian.Uint32(head) != HelloMagic {
+		log.Fatal("Bad BEP Magic")
+	}
+	
+	length := binary.BigEndian.Uint16(head[4:])
+	helloPayload := make([]byte, length)
+	if _, err := io.ReadFull(r, helloPayload); err != nil { return }
+	log.Println(">> Received Peer Hello")
+
+	// 2. Read Standard Messages
+	hLenBuf := make([]byte, 2)
+	bLenBuf := make([]byte, 4)
+	
+	for {
+		// Header Length
+		if _, err := io.ReadFull(r, hLenBuf); err != nil { return }
+		hLen := binary.BigEndian.Uint16(hLenBuf)
+		
+		// Header
+		hData := make([]byte, hLen)
+		if _, err := io.ReadFull(r, hData); err != nil { return }
+		
+		// Body Length
+		if _, err := io.ReadFull(r, bLenBuf); err != nil { return }
+		bLen := binary.BigEndian.Uint32(bLenBuf)
+		
+		// Body
+		bData := make([]byte, bLen)
+		if _, err := io.ReadFull(r, bData); err != nil { return }
+		
+		// Proto Header: Field 1 = Type (varint)
+		// Very basic manual proto parsing
+		msgType := -1
+		if len(hData) > 2 && hData[0] == 0x08 {
+			msgType = int(hData[1])
+		}
+		
+		typeStr := "Unknown"
+		switch msgType {
+		case 0: typeStr = "ClusterConfig"
+		case 1: typeStr = "Index"
+		case 6: typeStr = "Ping"
+		case 7: typeStr = "Close"
+		}
+		
+		log.Printf("BEP Message: %s (%d bytes)", typeStr, bLen)
+	}
+}
+
+func appendVarint(b []byte, v uint64) []byte {
+	for v >= 1<<7 {
+		b = append(b, uint8(v&0x7f|0x80))
+		v >>= 7
+	}
+	return append(b, uint8(v))
+}
+
+// --- Device ID Generation ---
+
+func generateIdentity() (tls.Certificate, []byte, string) {
+	priv, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	tmpl := x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		NotBefore:    time.Now().Add(-1 * time.Hour),
+		NotAfter:     time.Now().Add(87600 * time.Hour),
+	}
+	der, _ := x509.CreateCertificate(rand.Reader, &tmpl, &tmpl, &priv.PublicKey, priv)
+	cert := tls.Certificate{Certificate: [][]byte{der}, PrivateKey: priv}
+	hash := sha256.Sum256(der)
+	return cert, hash[:], getDeviceID(der)
+}
+
+func getDeviceID(certDER []byte) string {
+	hash := sha256.Sum256(certDER)
+	s := base32.StdEncoding.WithPadding(base32.NoPadding).EncodeToString(hash[:])
+	
+	var id strings.Builder
+	for i := 0; i < 4; i++ {
+		if i > 0 { id.WriteRune('-') }
+		chunk := s[i*13 : i*13+13]
+		id.WriteString(chunk)
+		id.WriteRune(luhn32(chunk))
+	}
+	return id.String()
+}
+
+func luhn32(s string) rune {
+	const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567"
+	factor := 1
+	sum := 0
+	for _, r := range s {
+		codepoint := strings.IndexRune(alphabet, r)
+		addend := factor * codepoint
+		if factor == 2 { factor = 1 } else { factor = 2 }
+		addend = (addend / 32) + (addend % 32)
+		sum += addend
+	}
+	rem := sum % 32
+	check := (32 - rem) % 32
+	return rune(alphabet[check])
+}
+```
+
+---
+
+Optimize the latency.
+
+```
+
+```
+
+### Core Rules
+
+- **State:** Treat all prior code as auto-applied unless explicitly stated as failed or requiring change.
+- **Reasoning:** Before providing the script, provide a rigorous reasoning. Explain the *why, what, and how* of your changes, discuss assumptions and alternatives, and justify your chosen approach.
+- **Code Output (Bash Script):**
+  - **Single Script:** You must provide a **single** Bash script inside a ```bash``` code block that performs all necessary file operations.
+  - **File Creation/Rewrite:** To create or overwrite files, use `cat << 'EOF' > path/to/file` (heredoc) syntax. Do not use partials; write the full file content within the heredoc.
+  - **Directory Handling:** Ensure you use `mkdir -p` for any new directories before creating files inside them.
+  - **Deletions/Moves:** Use `rm` to delete files and `mv` to move/rename files as needed.
+  - **completeness:** The script must be copy-paste ready and capable of executing the full refactor or feature implementation in one go.
+
+**Example Format:**
+```bash
+#!/bin/bash
+
+# Create directory
+mkdir -p path/to/dir
+# Create/Overwrite file
+cat << 'EOF' > path/to/dir/file.ext
+Full content of the file goes here...
+EOF
+# Remove old file
+rm path/to/old_file.ext
+```
